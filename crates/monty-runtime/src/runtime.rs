@@ -1,0 +1,354 @@
+//! The celld integration uses only the public native runtime contract.
+use crate::{
+    Failure, Session,
+    exports::{Module, durable_classes},
+    value,
+};
+use api::{HostCall, HostReply, Response, Step};
+use celld_runtime as api;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+pub struct Monty;
+const DESCRIPTOR: api::Descriptor = api::Descriptor {
+    extension: "py",
+    main_module: "index.py",
+    artifact_prefix: "# celld:monty-native-v1\n",
+    required_feature: "monty-native-v1",
+};
+impl api::Runtime for Monty {
+    fn descriptor(&self) -> &api::Descriptor {
+        &DESCRIPTOR
+    }
+    fn types(&self) -> &'static str {
+        crate::TYPES
+    }
+    fn compile(&self, source: &str) -> api::Result<Box<dyn api::Program>> {
+        if source.len() > 256 * 1024 {
+            return Err("Monty source exceeds 256 KiB".into());
+        }
+        let classes = durable_classes(source)?;
+        Ok(Box::new(Program {
+            http: Module::compile(source)?,
+            objects: classes
+                .iter()
+                .map(|name| {
+                    Module::compile_class(source, name).map(|module| (name.clone(), module))
+                })
+                .collect::<Result<_, _>>()?,
+            classes,
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct Program {
+    http: Module,
+    objects: HashMap<String, Module>,
+    classes: Vec<String>,
+}
+impl api::Program for Program {
+    fn fork(&self) -> Box<dyn api::Program> {
+        Box::new(self.clone())
+    }
+    fn classes(&self) -> &[String] {
+        &self.classes
+    }
+    fn error_response(&self, error: api::Failure, durable: bool) -> Response {
+        let error = json!({"status":error.status,"code":error.code,"message":error.message});
+        json_response(
+            if durable {
+                200
+            } else {
+                error["status"].as_u64().unwrap() as u16
+            },
+            json!({"error":error}),
+        )
+    }
+    fn start(&self, call: api::Invocation) -> api::Result<(Box<dyn api::Execution>, Step)> {
+        self.start_inner(call).map_err(Into::into)
+    }
+}
+impl Program {
+    fn start_inner(
+        &self,
+        call: api::Invocation,
+    ) -> Result<(Box<dyn api::Execution>, Step), Failure> {
+        let input = call.request;
+        let url =
+            url::Url::parse(&input.url).map_err(|_| Failure::arguments("invalid request URL"))?;
+        let path = url.path().strip_prefix('/').unwrap_or("");
+        let name = percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .map_err(|_| Failure::arguments("invalid handler name"))?;
+        if !call.alarm {
+            if path.contains('/')
+                || name.starts_with('_')
+                || (call.object.is_none() && self.http.get(&name).is_none())
+            {
+                return complete(text_response(404, "unknown handler", vec![]));
+            }
+            if input.method != "POST" {
+                return complete(text_response(
+                    405,
+                    "POST required",
+                    vec![("allow".into(), "POST".into())],
+                ));
+            }
+        }
+        let args: Value = if input.body.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_slice(&input.body)
+                .map_err(|_| Failure::arguments("request body must be a UTF-8 JSON object"))?
+        };
+        let (function, args, metadata) = if let Some(object) = call.object {
+            if !call.alarm && name == "alarm" {
+                return Err("alarm is dispatched by the host".into());
+            }
+            let function = self
+                .objects
+                .get(&object.class)
+                .and_then(|m| m.get(if call.alarm { "alarm" } else { &name }))
+                .ok_or(if call.alarm {
+                    "define alarm(self) before scheduling an alarm"
+                } else {
+                    "unknown public method"
+                })?;
+            let arguments =
+                if call.alarm {
+                    json!({})
+                } else {
+                    let wire = args["wire"]
+                        .as_str()
+                        .ok_or_else(|| Failure::arguments("missing typed object arguments"))?;
+                    value::to_json(&serde_json::from_str(wire).map_err(|e| {
+                        Failure::arguments(format!("invalid object arguments: {e}"))
+                    })?)?
+                };
+            (
+                function,
+                arguments,
+                json!({"id":object.id,"env":call.env,"request":if call.alarm { json!({}) } else { args["request"].clone() }}),
+            )
+        } else {
+            let function = self.http.get(&name).ok_or("unknown handler")?;
+            (
+                function,
+                args,
+                json!({"id":null,"env":call.env,"request":{"url":input.url,"method":input.method,"headers":headers_object(input.headers)}}),
+            )
+        };
+        let (session, event) = Session::start(function, &args, &metadata)?;
+        let mut execution = Execution {
+            session: Some(session),
+            request: metadata["request"].clone(),
+        };
+        let step = execution.event(event)?;
+        Ok((Box::new(execution), step))
+    }
+}
+
+struct Execution {
+    session: Option<Session>,
+    request: Value,
+}
+impl api::Execution for Execution {
+    fn resume(&mut self, reply: HostReply) -> api::Result<Step> {
+        self.resume_inner(reply).map_err(Into::into)
+    }
+}
+impl Execution {
+    fn resume_inner(&mut self, reply: HostReply) -> Result<Step, Failure> {
+        let session = self.session.as_mut().ok_or("execution already completed")?;
+        let event = match reply {
+            HostReply::Fetch(r) => {
+                session.resume_fetch(r.status, headers_object(r.headers), r.body)?
+            }
+            HostReply::Object(r) => session.resume(
+                serde_json::from_slice(&r.body)
+                    .map_err(|e| format!("invalid durable response: {e}"))?,
+            )?,
+            HostReply::Value(v) => session.resume(json!({"result":v}))?,
+            HostReply::Timestamp(Some(ms)) => session.resume(value::timestamp_reply(ms)?)?,
+            HostReply::Timestamp(None) => session.resume(json!({"result":null}))?,
+            HostReply::Error(error) => session.resume(json!({"error":error}))?,
+        };
+        self.event(event)
+    }
+    fn event(&mut self, mut event: Value) -> Result<Step, Failure> {
+        loop {
+            let suspended = event["done"] != true;
+            match self.event_once(event) {
+                Err(error) if suspended => {
+                    // Host argument errors are catchable Python exceptions,
+                    // including validation performed at this typed boundary.
+                    event = self
+                        .session
+                        .as_mut()
+                        .ok_or("execution already completed")?
+                        .resume(json!({"error":error.message}))?;
+                }
+                result => return result,
+            }
+        }
+    }
+    fn event_once(&mut self, event: Value) -> Result<Step, Failure> {
+        let session = self.session.as_mut().ok_or("execution already completed")?;
+        if event["done"] == true {
+            let response = match session.take_response() {
+                Some(r) => Response {
+                    status: r.status,
+                    headers: r.headers,
+                    body: r.body,
+                },
+                None => json_response(200, json!({"wire":event["wire"]})),
+            };
+            self.session.take();
+            return Ok(Step::Return(response));
+        }
+        let args = &event["args"];
+        let text = |i: usize| {
+            args[i]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("expected string argument".to_owned())
+        };
+        let call = match event["operation"]
+            .as_str()
+            .ok_or("missing host operation")?
+        {
+            "storage.get" => HostCall::Get(text(0)?),
+            "storage.put" => HostCall::Put(text(0)?, args[1].clone()),
+            "storage.delete" => HostCall::Delete(text(0)?),
+            "storage.delete_all" => HostCall::Clear,
+            "storage.list" => HostCall::List {
+                prefix: text(0)?,
+                limit: args[1]
+                    .as_u64()
+                    .filter(|n| *n <= 1000)
+                    .ok_or("list limit must be 0-1000")? as usize,
+                reverse: args[2].as_bool().ok_or("reverse must be bool")?,
+            },
+            "storage.sql" => HostCall::Sql {
+                query: text(0)?,
+                bindings: args[1]
+                    .as_array()
+                    .ok_or("SQL bindings must be an array")?
+                    .clone(),
+            },
+            "storage.get_alarm" => HostCall::GetAlarm,
+            "storage.set_alarm" => {
+                let at = if let Some(seconds) = args[0].as_f64() {
+                    let at = chrono::Utc::now().timestamp_millis() as f64 + seconds * 1000.0;
+                    if !at.is_finite() || at < 0.0 || at >= i64::MAX as f64 {
+                        return Err("invalid alarm duration".into());
+                    }
+                    at as i64
+                } else {
+                    chrono::DateTime::parse_from_rfc3339(&text(0)?)
+                        .map_err(|_| "alarm datetime must include a timezone")?
+                        .timestamp_millis()
+                };
+                HostCall::SetAlarm(at)
+            }
+            "storage.delete_alarm" => HostCall::DeleteAlarm,
+            "storage.transaction_begin" => HostCall::BeginTransaction,
+            "storage.transaction_commit" => HostCall::CommitTransaction,
+            "storage.transaction_rollback" => HostCall::RollbackTransaction,
+            "storage.sync" => HostCall::Sync,
+            "sleep" => HostCall::Sleep(std::time::Duration::from_secs_f64(
+                args[0]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 30.0)
+                    .ok_or("sleep must be between 0 and 30 seconds")?,
+            )),
+            "fetch" => HostCall::Fetch(api::Request {
+                url: text(0)?,
+                method: text(1)?,
+                headers: args[2]
+                    .as_object()
+                    .ok_or("invalid fetch headers")?
+                    .iter()
+                    .map(|(k, v)| {
+                        v.as_str()
+                            .map(|v| (k.clone(), v.to_owned()))
+                            .ok_or("invalid header")
+                    })
+                    .collect::<Result<_, _>>()?,
+                body: match session.take_fetch_body() {
+                    Some(body) => body,
+                    None => match &args[3] {
+                        Value::Null => Vec::new(),
+                        Value::String(body) => body.as_bytes().to_vec(),
+                        _ => return Err("invalid fetch body".into()),
+                    },
+                },
+            }),
+            "object.call" => HostCall::CallObject {
+                object: api::Object {
+                    class: text(0)?,
+                    id: text(1)?,
+                },
+                method: text(2)?,
+                body: serde_json::to_vec(&json!({"wire":args[3],"request":self.request}))
+                    .map_err(|e| e.to_string())?,
+            },
+            "now" => HostCall::Now,
+            "uuid" => HostCall::Uuid,
+            "log" => HostCall::Log(text(0)?),
+            _ => return Err("unknown capability".into()),
+        };
+        Ok(Step::Call(call))
+    }
+}
+
+impl From<Failure> for api::Failure {
+    fn from(e: Failure) -> Self {
+        Self {
+            status: e.status,
+            code: e.code,
+            message: e.message,
+        }
+    }
+}
+fn complete(response: Response) -> Result<(Box<dyn api::Execution>, Step), Failure> {
+    Ok((
+        Box::new(Execution {
+            session: None,
+            request: Value::Null,
+        }),
+        Step::Return(response),
+    ))
+}
+fn json_response(status: u16, value: Value) -> Response {
+    Response {
+        status,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: value.to_string().into_bytes(),
+    }
+}
+fn text_response(status: u16, body: &str, mut headers: Vec<(String, String)>) -> Response {
+    headers.push(("content-type".into(), "text/plain;charset=UTF-8".into()));
+    Response {
+        status,
+        headers,
+        body: body.as_bytes().to_vec(),
+    }
+}
+fn headers_object(headers: Vec<(String, String)>) -> Value {
+    let mut result = serde_json::Map::new();
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        match result.get_mut(&name) {
+            Some(Value::String(previous)) if name != "set-cookie" => {
+                previous.push_str(", ");
+                previous.push_str(&value);
+            }
+            _ => {
+                result.insert(name, json!(value));
+            }
+        }
+    }
+    Value::Object(result)
+}

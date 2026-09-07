@@ -1,0 +1,101 @@
+# Builds and upstream patches
+
+`cargo xtask build` prepares `target/celld` and builds the celld executable with
+Monty enabled. Only Git and the Rust toolchain are needed by the preparation
+command; `xtask` has no crate dependencies.
+
+## Reproducible inputs
+
+| Input | Purpose |
+| --- | --- |
+| `upstream/repository` | Official upstream Git repository |
+| `upstream/revision` | Full pinned commit SHA; currently celld 0.4.0 |
+| `patches/*.patch` | Patches applied in filename order |
+| `upstream/Cargo.lock` | Dependency lock for the generated celld workspace |
+| `Cargo.lock` | Dependency lock for the standalone runtime crates |
+
+The build fetches the exact upstream commit, checks and applies every patch,
+installs the committed application lockfile, and runs Cargo with `--locked`.
+Unchanged inputs reuse the prepared checkout without fetching. Dependency
+availability still determines whether Cargo itself can build offline.
+
+Preparation refuses to discard staged edits, unstaged edits, or untracked files
+in the generated checkout. A failed fetch or patch leaves the previous checkout
+intact. One invocation holds an operating-system file lock to prevent concurrent
+replacement; exiting or being killed releases it automatically. After a killed
+preparation, inspect any incomplete `target/celld-preparing` directory before
+removing it and retrying.
+
+## Commands
+
+```sh
+cargo xtask prepare
+cargo xtask build                       # optimized lab build
+cargo xtask build --release             # release build
+cargo xtask build --release --target x86_64-unknown-linux-gnu
+cargo xtask test
+```
+
+Binaries appear under the root `target` directory, for example
+`target/lab/celld` or `target/x86_64-unknown-linux-gnu/release/celld`.
+`cargo test --workspace --locked` checks the standalone crates without building
+celld. `cargo xtask test` additionally checks native host integration and the
+build utility. Run the HTTP end-to-end suite separately as described in
+[testing](testing.md).
+
+## Runtime boundary
+
+The API follows the current bounded execution model:
+
+1. `Runtime` describes and compiles an artifact and supplies editor types.
+2. `Program` caches compilation, forks once per worker slot, and starts calls.
+3. `Execution::resume` consumes a typed host reply. It returns either a completed
+   response or the next typed `HostCall`.
+
+Programs and suspended executions are `Send`, with no concurrent entry into an
+individual instance. Language execution must bound its interpreter CPU work.
+Dropping an execution cancels its interpreter state; celld independently owns
+I/O cancellation, transaction rollback, authority, and gate cleanup. Storage
+values are JSON; fetch and durable-call bodies cross the interface as byte
+buffers. Serialization of remote Python values belongs to Monty.
+
+The host provides a scoped context internally. Runtime code cannot select a
+storage scope, access a SQLite connection, or bypass an output gate. Python's
+fully typed `Context` remains part of the Monty crate.
+
+The patches are deliberately separate:
+
+- `0001-host-options.patch`: existing cell-density and S3 ETag options.
+- `0002-native-runtime.patch`: the language-independent native host bridge,
+  deployment hooks, feature negotiation, and public runtime registration.
+- `0003-link-monty.patch`: optional crate dependency, integration-test target,
+  and `celld::native::register(&celld_monty::Monty)` at startup.
+
+The registration patch uses celld's existing executable and preserves startup
+ordering. There is no copied launcher or dynamic plugin loader. A second tiny
+test runtime exercises registration, feature negotiation, async completion, and
+cancellation without importing Monty.
+
+## Updating the integration
+
+Normal Python/runtime changes belong in `crates/monty-runtime` and need no host
+patch change. Changes to the public contract belong in `crates/runtime-api`.
+
+For a host change, prepare the checkout and edit `target/celld`. Its Git index
+records the fully patched baseline, so `git diff` contains only your new edits:
+
+```sh
+git -C target/celld diff --binary > patches/0004-description.patch
+```
+
+Use `git add -N <path>` inside that checkout for a new file before exporting its
+diff. Review and retain the patch before restoring the generated checkout's
+edits; the next preparation will then apply the additional patch. To keep the
+series small, fold a reviewed follow-up into the relevant existing patch when
+updating upstream.
+
+To upgrade celld, change `upstream/revision`, rebase the patches against that
+commit, and update `upstream/Cargo.lock` when dependencies change. Run the full
+validation suite and compare benchmarks. The current native bridge is an
+internal refactor carried as a patch; its public interface is small, but it is
+not an upstream-supported plugin API yet.

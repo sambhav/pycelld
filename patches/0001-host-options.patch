@@ -1,0 +1,430 @@
+diff --git a/crates/celld/bucket.rs b/crates/celld/bucket.rs
+index 3ee16e7..2e31e01 100644
+--- a/crates/celld/bucket.rs
++++ b/crates/celld/bucket.rs
+@@ -23,6 +23,7 @@
+ //! In the same spirit a response that carries no CAS token is an error,
+ //! never an empty token a later conditional write would trust.
+ 
++use crate::s3_etag::S3EtagMode;
+ use anyhow::anyhow;
+ use anyhow::Context;
+ use bytes::Bytes;
+@@ -158,6 +159,7 @@ pub struct Bucket {
+     /// ambiguity must surface as `Err` so the caller reconciles.
+     pub cas_store: Arc<dyn ObjectStore>,
+     pub backend: StorageBackend,
++    s3_etag_mode: S3EtagMode,
+     /// Bucket name, for messages — the store is already bound to it.
+     pub name: String,
+     /// Empty, or a slash-terminated key prefix every operation is scoped
+@@ -470,6 +472,7 @@ impl Bucket {
+             paginated: Arc::new(UnpaginatedStore),
+             cas_store,
+             backend,
++            s3_etag_mode: S3EtagMode::Preserve,
+             name,
+             prefix,
+         }
+@@ -523,6 +526,7 @@ impl Bucket {
+             paginated: store.clone(),
+             cas_store: store,
+             backend: StorageBackend::Local,
++            s3_etag_mode: S3EtagMode::Preserve,
+             name: database.display().to_string(),
+             prefix: String::new(),
+         })
+@@ -546,6 +550,7 @@ impl Bucket {
+             azure: azure_env,
+         } = sources;
+         let (backend, bucket, prefix) = split_spec(bucket);
++        let s3_etag_mode = S3EtagMode::from_env()?;
+         // The prefix is spliced into keys as plain text and stripped off
+         // listed keys the same way. A character `object_store` would
+         // percent-encode would make the two disagree, so refuse it here
+@@ -694,6 +699,7 @@ impl Bucket {
+             paginated,
+             cas_store,
+             backend,
++            s3_etag_mode,
+             name: bucket.to_string(),
+             prefix,
+         })
+@@ -712,6 +718,25 @@ impl Bucket {
+         self.backend
+     }
+ 
++    /// Normalize only S3 tokens. GCS generations and other backends are opaque.
++    fn token(&self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
++        let token = self.backend.token(e_tag, version)?;
++        if self.backend == StorageBackend::S3 {
++            self.s3_etag_mode.token(token)
++        } else {
++            Ok(token)
++        }
++    }
++
++    fn update(&self, token: &str) -> anyhow::Result<UpdateVersion> {
++        let token = if self.backend == StorageBackend::S3 {
++            self.s3_etag_mode.token(token.to_string())?
++        } else {
++            token.to_string()
++        };
++        Ok(self.backend.update(&token))
++    }
++
+     /// Scope a caller's key to this client's prefix.
+     fn key(&self, key: &str) -> String {
+         format!("{}{key}", self.prefix)
+@@ -729,7 +754,6 @@ impl Bucket {
+         match self.store.get(&Path::from(key.as_str())).await {
+             Ok(result) => {
+                 let token = self
+-                    .backend
+                     .token(result.meta.e_tag.clone(), result.meta.version.clone())
+                     .with_context(|| format!("read {}://{}/{key}", self.scheme(), self.name))?;
+                 let bytes = result.bytes().await.with_context(|| {
+@@ -750,7 +774,6 @@ impl Bucket {
+         match self.store.head(&Path::from(key.as_str())).await {
+             Ok(meta) => {
+                 let token = self
+-                    .backend
+                     .token(meta.e_tag, meta.version)
+                     .with_context(|| format!("head {}://{}/{key}", self.scheme(), self.name))?;
+                 Ok(Some((meta.size, token)))
+@@ -844,7 +867,7 @@ impl Bucket {
+         let key = self.key(key);
+         let mode = match token {
+             None => PutMode::Create,
+-            Some(token) => PutMode::Update(self.backend.update(token)),
++            Some(token) => PutMode::Update(self.update(token)?),
+         };
+         match self
+             .cas_store
+@@ -859,16 +882,13 @@ impl Bucket {
+                 // The write applied; a result without a usable token still
+                 // surfaces as `Err`, which callers already treat as "may
+                 // have committed" and reconcile.
+-                let token = self
+-                    .backend
+-                    .token(result.e_tag, result.version)
+-                    .with_context(|| {
+-                        format!(
+-                            "conditional write {}://{}/{key} applied without a CAS token",
+-                            self.scheme(),
+-                            self.name
+-                        )
+-                    })?;
++                let token = self.token(result.e_tag, result.version).with_context(|| {
++                    format!(
++                        "conditional write {}://{}/{key} applied without a CAS token",
++                        self.scheme(),
++                        self.name
++                    )
++                })?;
+                 Ok(Some(token))
+             }
+             Err(error) if is_clean_cas_rejection(&error) => Ok(None),
+@@ -1170,7 +1190,7 @@ impl Bucket {
+                             self.name
+                         ));
+                     };
+-                    PutMode::Update(self.backend.update(&cas))
++                    PutMode::Update(self.update(&cas)?)
+                 }
+                 // Nothing there: only a condition that an absent object can
+                 // satisfy may write, and it writes as a create so that a
+@@ -1199,7 +1219,6 @@ impl Bucket {
+             Ok(result) => Ok(Some(BlobMeta {
+                 size,
+                 cas: self
+-                    .backend
+                     .token(result.e_tag.clone(), result.version.clone())
+                     .ok(),
+                 etag: result.e_tag,
+@@ -1330,10 +1349,7 @@ impl Bucket {
+             size: meta.size,
+             etag: meta.e_tag.clone(),
+             version: meta.version.clone(),
+-            cas: self
+-                .backend
+-                .token(meta.e_tag.clone(), meta.version.clone())
+-                .ok(),
++            cas: self.token(meta.e_tag.clone(), meta.version.clone()).ok(),
+             uploaded_ms: meta.last_modified.timestamp_millis(),
+             attributes: BlobAttributes::read(attributes),
+         }
+diff --git a/crates/celld/env_vars.rs b/crates/celld/env_vars.rs
+index 5350c6e..e3fd549 100644
+--- a/crates/celld/env_vars.rs
++++ b/crates/celld/env_vars.rs
+@@ -14,6 +14,8 @@ use anyhow::{anyhow, bail};
+ /// they cannot return a configuration error at the point of use. This pass
+ /// makes those reads infallible without giving malformed values a default.
+ pub fn validate() -> anyhow::Result<()> {
++    cell_isolate_limit()?;
++    crate::s3_etag::S3EtagMode::from_env()?;
+     for name in [
+         "CELLD_CLOUD",
+         "CELLD_CLOUD_RESTART_ON_DEPLOY",
+@@ -180,3 +182,52 @@ where
+ {
+     Ok(positive(name)?.unwrap_or(default))
+ }
++
++/// Operators may trade cell density for CPU parallelism without increasing
++/// the engine's existing 32-cell per-heap failure boundary.
++pub fn cell_isolate_limit() -> anyhow::Result<usize> {
++    parse_cell_isolate_limit(value("CELLD_MAX_CELLS_PER_ISOLATE")?)
++}
++
++pub fn parse_cell_isolate_limit(value: Option<String>) -> anyhow::Result<usize> {
++    let name = "CELLD_MAX_CELLS_PER_ISOLATE";
++    let limit = parse_positive::<usize>(name, value)?.unwrap_or(32);
++    if limit > 32 {
++        bail!("{name} must be between 1 and 32, not {limit}");
++    }
++    Ok(limit)
++}
++
++#[cfg(test)]
++mod cell_isolate_limit_tests {
++    use super::parse_cell_isolate_limit;
++
++    #[test]
++    fn preserves_default_and_accepts_lower_density() {
++        assert_eq!(parse_cell_isolate_limit(None).unwrap(), 32);
++        for count in 1..=32 {
++            assert_eq!(
++                parse_cell_isolate_limit(Some(count.to_string())).unwrap(),
++                count
++            );
++        }
++    }
++
++    #[test]
++    fn rejects_invalid_or_larger_failure_boundaries() {
++        for value in [
++            "",
++            "0",
++            "-1",
++            "33",
++            "1.5",
++            "auto",
++            "999999999999999999999999",
++        ] {
++            assert!(
++                parse_cell_isolate_limit(Some(value.into())).is_err(),
++                "{value}"
++            );
++        }
++    }
++}
+diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
+index b7b9a43..e2c290a 100644
+--- a/crates/celld/lib.rs
++++ b/crates/celld/lib.rs
+@@ -329,6 +329,7 @@ pub mod deploy;
+ pub mod dev;
+ pub mod drain_token;
+ pub mod env_vars;
++pub mod s3_etag;
+ #[cfg(celld_internal_tests)]
+ #[allow(clippy::disallowed_methods)]
+ #[doc(hidden)]
+diff --git a/crates/celld/main/cli.rs b/crates/celld/main/cli.rs
+index e79ba3e..e99903f 100644
+--- a/crates/celld/main/cli.rs
++++ b/crates/celld/main/cli.rs
+@@ -62,11 +62,10 @@ impl Action {
+     /// parses. Sharing one stream between the two prefixes an operator's data
+     /// with whatever the process happened to warn about at startup, which is
+     /// how this was found -- an allocator warning landed in front of a value.
++    /// Help and version output are answers too, including on macOS where
++    /// unsupported allocator tuning can emit a startup warning.
+     pub(crate) fn stdout_is_data(&self) -> bool {
+-        !matches!(
+-            self,
+-            Self::Run(_) | Self::Dev(_) | Self::Help | Self::Version
+-        )
++        !matches!(self, Self::Run(_) | Self::Dev(_))
+     }
+ }
+ 
+@@ -346,6 +345,7 @@ ENVIRONMENT:
+   CELLD_ASSET_CACHE_BYTES         Asset cache limit
+ 
+ TUNING:
++  CELLD_S3_ETAG_MODE             S3 CAS token spelling: preserve (default), quoted, unquoted
+   CELLD_STORAGE_PROBE             `0` skips the startup conditional-write test
+                                   (default: on)
+   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
+@@ -366,6 +366,7 @@ TUNING:
+   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
+   CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
+   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
++  CELLD_MAX_CELLS_PER_ISOLATE     Cell packing limit (1..32, default: 32)
+   CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
+   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
+   CELLD_TOKIO_THREADS             Tokio runtime worker threads
+diff --git a/crates/celld/runtime.rs b/crates/celld/runtime.rs
+index f9f5062..f575d1f 100644
+--- a/crates/celld/runtime.rs
++++ b/crates/celld/runtime.rs
+@@ -297,7 +297,6 @@ pub fn admission_wait() -> std::time::Duration {
+ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
+     const GROW_AT: usize = 2;
+     const SHRINK_UNDER: usize = 1;
+-    const MAX_CELLS_PER_ISOLATE: usize = 32;
+     let cores = std::thread::available_parallelism()
+         .map(|n| n.get())
+         .unwrap_or(4);
+@@ -308,9 +307,11 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
+         shrink_under: SHRINK_UNDER,
+         max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
+         max_requests: env_usize("CELLD_MAX_REQUESTS"),
+-        // This is an engine blast-radius policy. The resident-cell and RSS
+-        // limits are the operator controls for node memory.
+-        max_cells: MAX_CELLS_PER_ISOLATE,
++        // Lower density can spread CPU-heavy cells over more isolates. The
++        // configuration cannot increase the existing per-heap failure bound;
++        // resident-cell and RSS limits still govern node memory admission.
++        max_cells: crate::env_vars::cell_isolate_limit()
++            .expect("validated CELLD_MAX_CELLS_PER_ISOLATE"),
+     }
+ }
+ 
+diff --git a/crates/celld/s3_etag.rs b/crates/celld/s3_etag.rs
+new file mode 100644
+index 0000000..acb1b71
+--- /dev/null
++++ b/crates/celld/s3_etag.rs
+@@ -0,0 +1,128 @@
++//! Optional spelling normalization for S3 conditional-write tokens.
++//!
++//! Preserve is the default: ETags are opaque. Compatibility modes only alter
++//! the surrounding quotes, never the value, and never turn a weak validator,
++//! list, or wildcard into an ownership precondition.
++
++use anyhow::{bail, ensure};
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum S3EtagMode {
++    #[default]
++    Preserve,
++    Quoted,
++    Unquoted,
++}
++
++impl S3EtagMode {
++    pub fn from_env() -> anyhow::Result<Self> {
++        Self::parse(crate::env_vars::value("CELLD_S3_ETAG_MODE")?.as_deref())
++    }
++
++    pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
++        match value {
++            None | Some("preserve") => Ok(Self::Preserve),
++            Some("quoted") => Ok(Self::Quoted),
++            Some("unquoted") => Ok(Self::Unquoted),
++            Some(value) => {
++                bail!("CELLD_S3_ETAG_MODE must be preserve, quoted, or unquoted, not {value:?}")
++            }
++        }
++    }
++
++    pub fn token(self, token: String) -> anyhow::Result<String> {
++        if self == Self::Preserve {
++            return Ok(token);
++        }
++        let value = token
++            .strip_prefix('"')
++            .and_then(|value| value.strip_suffix('"'))
++            .unwrap_or(&token);
++        // A narrow compatibility grammar: one nonempty ASCII opaque value.
++        // In particular, stripping quotes from "*" or a comma-containing
++        // value would change the meaning of the If-Match header.
++        ensure!(
++            !value.is_empty()
++                && value != "*"
++                && !value.starts_with("W/")
++                && value
++                    .bytes()
++                    .all(|c| c.is_ascii_graphic() && c != b'"' && c != b','),
++            "S3 ETag cannot be safely normalized: expected one nonempty strong token"
++        );
++        Ok(match self {
++            Self::Quoted => format!("\"{value}\""),
++            Self::Unquoted => value.to_string(),
++            Self::Preserve => unreachable!(),
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::S3EtagMode::{self, *};
++
++    #[test]
++    fn mode_is_explicit_and_strict() {
++        assert_eq!(S3EtagMode::parse(None).unwrap(), Preserve);
++        for (value, mode) in [
++            ("preserve", Preserve),
++            ("quoted", Quoted),
++            ("unquoted", Unquoted),
++        ] {
++            assert_eq!(S3EtagMode::parse(Some(value)).unwrap(), mode);
++        }
++        for value in ["", "true", "1", "ceph", "Quoted", " unquoted"] {
++            assert!(S3EtagMode::parse(Some(value)).is_err(), "{value}");
++        }
++    }
++
++    #[test]
++    fn default_preserves_the_exact_opaque_value() {
++        for token in ["abc", "\"abc\"", "multi-part-12", "provider-specific:ABC"] {
++            assert_eq!(Preserve.token(token.into()).unwrap(), token);
++        }
++    }
++
++    #[test]
++    fn normalizes_put_get_and_head_spellings_without_changing_the_value() {
++        for value in ["abc123", "9ab01-17", "ABC:123_+/="] {
++            let quoted = format!("\"{value}\"");
++            for input in [value, quoted.as_str()] {
++                assert_eq!(Quoted.token(input.into()).unwrap(), quoted);
++                assert_eq!(Unquoted.token(input.into()).unwrap(), value);
++            }
++        }
++    }
++
++    #[test]
++    fn refuses_tokens_that_could_weaken_a_precondition() {
++        for token in [
++            "",
++            "\"\"",
++            "*",
++            "\"*\"",
++            "W/\"abc\"",
++            "W/abc",
++            "\"W/abc\"",
++            "abc,def",
++            "\"abc,def\"",
++            "\"abc\",\"def\"",
++            "\"abc",
++            "abc\"",
++            "a\"b",
++            " abc",
++            "abc ",
++            "a b",
++            "a\tb",
++            "a\nb",
++            "a\rb",
++            "a\0b",
++            "é",
++        ] {
++            for mode in [Quoted, Unquoted] {
++                assert!(mode.token(token.into()).is_err(), "{mode:?}: {token:?}");
++            }
++        }
++    }
++}

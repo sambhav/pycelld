@@ -1,0 +1,18 @@
+name: Cell packing checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  packing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - run: cargo +1.98.1 xtask prepare
+      - name: Test configuration, packing, and retirement
+        run: cargo +1.98.1 test --manifest-path tools/packing-checks/Cargo.toml --locked

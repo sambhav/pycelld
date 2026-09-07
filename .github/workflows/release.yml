@@ -1,0 +1,205 @@
+name: Native binaries
+
+# PRs build review artifacts. Label a same-repository PR `release-binaries`,
+# push `candidate`, or run manually to also create an immutable-source draft.
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  push:
+    branches: [candidate]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-binaries-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.98.1
+  CARGO_BUILD_JOBS: '2'
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-binaries') ||
+      contains(github.event.pull_request.labels.*.name, 'release-binaries')
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust and verify native target
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fork-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-${{ env.SOURCE_SHA }}
+          restore-keys: fork-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
+      - run: cargo xtask prepare
+      - name: Test configuration and placement
+        run: cargo test --manifest-path tools/packing-checks/Cargo.toml --locked
+      - name: Build release binary
+        run: cargo xtask build --target "$TARGET" --release
+      - name: Cache the successful build before running binary checks
+        uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Test S3 ETag spelling and conditional-write fencing through the binary
+        run: python3 tools/storage-checks/probe.py "target/$TARGET/release/celld" -v
+      - name: Package and verify binary
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/celld"
+          "$binary" --help | grep -F CELLD_S3_ETAG_MODE
+          "$binary" --help | grep -F CELLD_MAX_CELLS_PER_ISOLATE
+          python3 - <<'PY'
+          import gzip, hashlib, json, os, pathlib, subprocess, tomllib
+          target = os.environ['TARGET']
+          binary = pathlib.Path(f'target/{target}/release/celld')
+          version = tomllib.loads(pathlib.Path('target/celld/crates/celld/Cargo.toml').read_text())['package']['version']
+          reported = subprocess.check_output([str(binary), '--version'], text=True).strip()
+          assert reported == f'celld {version}', reported
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert source == os.environ['SOURCE_SHA']
+          out = pathlib.Path('out'); out.mkdir()
+          archive = out / f'celld-{target}.gz'
+          with archive.open('wb') as output:
+              subprocess.run(['gzip', '-9', '-n', '-c', str(binary)], stdout=output, check=True)
+          assert gzip.decompress(archive.read_bytes()) == binary.read_bytes()
+          (out / f'build-{target}.json').write_text(json.dumps({
+              'target': target, 'version': version, 'source_sha': source,
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'upstream_revision': pathlib.Path('upstream/revision').read_text().strip(),
+              'rust_version': os.environ['RUST_VERSION'], 'profile': 'release',
+              'archive': archive.name, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+              'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+          }, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celld-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    name: Verify complete release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: celld-*
+          path: assets
+          merge-multiple: true
+      - name: Verify all platforms and write checksums
+        run: |
+          python3 - <<'PY'
+          import gzip, hashlib, json, os, pathlib, shutil
+          assets = pathlib.Path('assets')
+          targets = {'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-apple-darwin'}
+          builds = [json.loads(p.read_text()) for p in sorted(assets.glob('build-*.json'))]
+          assert len(builds) == len(targets)
+          assert {b['target'] for b in builds} == targets
+          assert len({b['version'] for b in builds}) == 1
+          checksums = []
+          for b in builds:
+              assert b['source_sha'] == os.environ['SOURCE_SHA']
+              assert b['repository'] == os.environ['GITHUB_REPOSITORY']
+              assert b['profile'] == 'release'
+              assert b['archive'] == f"celld-{b['target']}.gz"
+              data = (assets / b['archive']).read_bytes()
+              assert hashlib.sha256(data).hexdigest() == b['sha256']
+              assert hashlib.sha256(gzip.decompress(data)).hexdigest() == b['binary_sha256']
+              checksums.append(f"{b['sha256']}  {b['archive']}")
+          (assets / 'SHA256SUMS').write_text('\n'.join(sorted(checksums)) + '\n')
+          (assets / 'BUILD_INFO.json').write_text(json.dumps(builds, indent=2) + '\n')
+          shutil.copy('LICENSE', assets / 'LICENSE')
+          for p in assets.glob('build-*.json'): p.unlink()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celld-release-assets
+          path: assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  draft-release:
+    name: Create fork draft release
+    needs: assemble
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'release-binaries') &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: celld-release-assets
+          path: assets
+      - name: Create draft with exact source and all verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import json; print(json.load(open("assets/BUILD_INFO.json"))[0]["version"])')
+          tag="v$version-fork.${SOURCE_SHA:0:12}"
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path('notes.md').write_text(
+              'Native celld fork build from `' + os.environ['SOURCE_SHA'] + '`.\n\n'
+              'Includes configurable cell density and opt-in S3 ETag spelling compatibility.\n\n'
+              'Linux x86-64/ARM64 and macOS Intel/Apple Silicon binaries passed the same '
+              'configuration, placement, and S3 conditional-write checks on native GitHub runners.\n\n'
+              'Verify downloads against `SHA256SUMS`; `BUILD_INFO.json` records source and toolchain. '
+              'macOS binaries are not Apple-notarized.\n')
+          PY
+          # Do not replace an existing release or move an existing tag.
+          gh release create "$tag" --draft --prerelease --target "$SOURCE_SHA" \
+            --title "celld $version — fork ${SOURCE_SHA:0:12}" --notes-file notes.md assets/*

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/monty-runtime", "crates/runtime-api"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# The lab fast loop: release optimization minus the fat-LTO relink that
+# dominates rebuild time, plus incremental compilation. Shipped artifacts
+# stay on `release`.
+[profile.lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+# The lab image keeps symbols so `perf` on a node attributes CPU by function;
+# the shipped release profile stays stripped.
+strip = false
+debug = "line-tables-only"

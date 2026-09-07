@@ -1,0 +1,1783 @@
+diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+index 487c753..421841b 100644
+--- a/crates/celld/Cargo.toml
++++ b/crates/celld/Cargo.toml
+@@ -2,7 +2,7 @@
+ name = "celld"
+ version = "0.4.0"
+ edition = "2021"
+-rust-version = "1.94.1"
++rust-version = "1.95"
+ license = "Apache-2.0"
+ 
+ 
+@@ -20,7 +20,12 @@ check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
+ [lints.clippy]
+ disallowed_macros = "forbid"
+ 
++[[test]]
++name = "native_extension"
++path = "../../../../tests/native_extension.rs"
++
+ [dependencies]
++celld-runtime = { path = "../../../../crates/runtime-api" }
+ async-trait.workspace = true
+ chrono.workspace = true
+ aes.workspace = true
+diff --git a/crates/celld/asyncrt.rs b/crates/celld/asyncrt.rs
+index 33aaf33..ec6fc84 100644
+--- a/crates/celld/asyncrt.rs
++++ b/crates/celld/asyncrt.rs
+@@ -310,8 +310,9 @@ pub fn interval_at(start_ms: u64, period: Duration) -> Interval {
+     }
+ }
+ 
+-/// The output of one asynchronous JavaScript operation.
++/// The output of one asynchronous worker operation.
+ pub enum OpOut {
++    Native(celld_runtime::HostReply),
+     Str(String),
+     Bytes(Vec<u8>),
+ }
+diff --git a/crates/celld/control_plane.rs b/crates/celld/control_plane.rs
+index 3a58931..f19cfb0 100644
+--- a/crates/celld/control_plane.rs
++++ b/crates/celld/control_plane.rs
+@@ -1574,9 +1574,7 @@ fn presence_request(
+     );
+     // Deployment features come from the shared list so the advertised
+     // capabilities can never drift from what apply_deployment accepts.
+-    let capabilities = crate::protocol::SUPPORTED_DEPLOYMENT_FEATURES
+-        .iter()
+-        .copied()
++    let capabilities = crate::protocol::supported_deployment_features()
+         .chain(["sqlite-explorer-v1", "sqlite-explorer-v2"])
+         .collect::<Vec<_>>()
+         .join(",");
+diff --git a/crates/celld/deploy.rs b/crates/celld/deploy.rs
+index fdaf017..3965f2e 100644
+--- a/crates/celld/deploy.rs
++++ b/crates/celld/deploy.rs
+@@ -436,13 +436,29 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+         .filter(|path| !path.as_os_str().is_empty())
+         .map(Path::to_path_buf)
+         .unwrap_or_else(|| PathBuf::from("."));
+-    let project = read_project(&config_path, &root)?;
++    let mut project = read_project(&config_path, &root)?;
++    let is_native = project
++        .entry
++        .as_deref()
++        .is_some_and(crate::native::is_entry);
+     let started = Instant::now();
+     let built_assets = project.assets.as_ref().map(build_assets).transpose()?;
+     let bundle = project
+         .entry
+         .as_deref()
+         .map(|entry| {
++            if is_native {
++                if project.no_bundle {
++                    bail!("Native entrypoints cannot set no_bundle");
++                }
++                if project.has_workflows || !project.queue_consumers.is_empty() {
++                    bail!("Native runtime does not support workflows or queue consumers");
++                }
++                return Ok(BundleOutput {
++                    bundle: crate::native::bundle(&root, entry)?,
++                    wasm: Vec::new(),
++                });
++            }
+             if project.no_bundle {
+                 // Already bundled by the caller's toolchain. Read it as it is;
+                 // running esbuild over a Vite build is what corrupts it. A
+@@ -462,9 +478,16 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+         .transpose()?;
+     let bundled_in = started.elapsed();
+ 
+-    // esbuild emits one JS module plus a copy of every wasm file the bundle
+-    // imports; the copies ship as sibling modules.
+-    let module_name = "index.js".to_string();
++    // Native ships one native source artifact. esbuild may emit sibling WASM.
++    let module_name = if is_native {
++        crate::native::runtime().unwrap().descriptor().main_module
++    } else {
++        "index.js"
++    }
++    .to_string();
++    if project.entry.is_some() {
++        project.metadata["main_module"] = json!(module_name);
++    }
+     let (mut modules, wasm_modules) = match bundle {
+         Some(output) => (vec![(module_name.clone(), output.bundle)], output.wasm),
+         None => (Vec::new(), Vec::new()),
+@@ -516,6 +539,15 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+         // partially deserializing the manifest and failing at worker load.
+         required_features: {
+             let mut features = Vec::new();
++            if is_native {
++                features.push(
++                    crate::native::runtime()
++                        .unwrap()
++                        .descriptor()
++                        .required_feature
++                        .to_string(),
++                );
++            }
+             if built_assets.is_some() {
+                 features.push(FEATURE_ASSETS_V1.to_string());
+             }
+@@ -1522,6 +1554,19 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
+             );
+         }
+     }
++    // Class identity and SQLite registration come from Native source.
++    if main.as_deref().is_some_and(crate::native::is_entry) {
++        let source = std::fs::read_to_string(root.join(main.as_deref().unwrap()))?;
++        for class in crate::native::compile(&source)?.classes().iter().cloned() {
++            if do_classes.contains(&class) || sqlite_classes.contains(&class) {
++                bail!(
++                    "Native runtime registers {class} automatically; remove its explicit binding/migration"
++                );
++            }
++            do_classes.push(class.clone());
++            sqlite_classes.push(class);
++        }
++    }
+     let mut metadata = Map::new();
+     if main.is_some() {
+         metadata.insert("main_module".into(), json!("index.js"));
+diff --git a/crates/celld/dev.rs b/crates/celld/dev.rs
+index 4059b7f..e2e9f6c 100644
+--- a/crates/celld/dev.rs
++++ b/crates/celld/dev.rs
+@@ -149,10 +149,11 @@ impl ProjectWatcher {
+                 .context("the project watcher stopped")?
+             {
+                 Ok(event)
+-                    if event
+-                        .paths
+-                        .iter()
+-                        .any(|path| !ignored_project_path(&self.project, path)) =>
++                    if !event.kind.is_access()
++                        && event
++                            .paths
++                            .iter()
++                            .any(|path| !ignored_project_path(&self.project, path)) =>
+                 {
+                     return Ok(())
+                 }
+@@ -176,6 +177,8 @@ fn ignored_project_path(project: &Path, path: &Path) -> bool {
+         ".svn",
+         ".turbo",
+         ".yarn",
++        ".venv",
++        "__pycache__",
+         "bower_components",
+         "coverage",
+         "node_modules",
+diff --git a/crates/celld/js.rs b/crates/celld/js.rs
+index 88c5c10..d8efcb9 100644
+--- a/crates/celld/js.rs
++++ b/crates/celld/js.rs
+@@ -1485,6 +1485,9 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
+             let s = v8::String::new(tc, &v).unwrap();
+             r.resolve(tc, s.into());
+         }
++        Ok(asyncrt::OpOut::Native(_)) => {
++            unreachable!("Native operations have a native driver")
++        }
+         Ok(asyncrt::OpOut::Bytes(b)) => {
+             let v = bytes_value(tc, b);
+             r.resolve(tc, v);
+@@ -1788,6 +1791,10 @@ pub struct WorkerConfig {
+     /// isolate built from it carries the value as a slot, so its host calls
+     /// resolve against the deployment graph it was built with.
+     pub generation: crate::generation::GenerationId,
++    /// Compile once per configuration. Native programs are Send but not
++    /// Sync; each pool slot clones the cached template under this mutex and
++    /// subsequently executes its own copy under the pool's turn permit.
++    native_program: OnceLock<Result<Mutex<Box<dyn celld_runtime::Program>>, String>>,
+     /// The external (`node:*`/`cloudflare:*`) imports of `src`.
+     ///
+     /// The scan walks the whole bundle, which an esbuild artifact makes
+@@ -1852,7 +1859,11 @@ impl WorkerConfig {
+             modules,
+             compat,
+         } = options;
+-        let main_imports = modules::scan_external_imports(&src);
++        let main_imports = if crate::native::is_artifact(&src) {
++            Default::default()
++        } else {
++            modules::scan_external_imports(&src)
++        };
+         let module_imports = es_module_sources(&modules)
+             .map(|(_name, source)| modules::scan_external_imports(source))
+             .collect();
+@@ -1888,6 +1899,7 @@ impl WorkerConfig {
+             loader_env: None,
+             crons: Vec::new(),
+             generation: 0,
++            native_program: OnceLock::new(),
+             main_imports,
+             module_imports,
+         }
+@@ -1967,7 +1979,7 @@ pub struct CellStorage<'a> {
+     pub epoch: u64,
+ }
+ 
+-pub struct Worker {
++pub struct JsWorker {
+     inner: Option<WorkerIsolate>,
+ }
+ 
+@@ -2094,7 +2106,7 @@ struct Entered<'s> {
+     fetch: v8::Local<'s, v8::Function>,
+ }
+ 
+-impl std::ops::Deref for Worker {
++impl std::ops::Deref for JsWorker {
+     type Target = WorkerIsolate;
+ 
+     fn deref(&self) -> &Self::Target {
+@@ -2102,7 +2114,7 @@ impl std::ops::Deref for Worker {
+     }
+ }
+ 
+-impl std::ops::DerefMut for Worker {
++impl std::ops::DerefMut for JsWorker {
+     fn deref_mut(&mut self) -> &mut Self::Target {
+         self.inner.as_mut().expect("Worker isolate unavailable")
+     }
+@@ -2654,10 +2666,9 @@ pub fn drop_next_gated_reply_task_for_test() {
+ }
+ 
+ pub struct InFlight {
+-    /// The handler's promise. A `Global` because it outlives the turn that
+-    /// created it: Locals never cross a turn, exactly as workerd's
+-    /// `Worker::Lock` never does.
+-    promise: v8::Global<v8::Promise>,
++    /// A JavaScript handler's promise. Native runtimes keep their continuation in
++    /// `native`; both backends share timing, cancellation and pool accounting.
++    promise: Option<v8::Global<v8::Promise>>,
+     context: Arc<IoContext>,
+     /// The cell this event belongs to, and `None` for stateless work.
+     ///
+@@ -2694,7 +2705,8 @@ pub struct InFlight {
+     failure: Option<String>,
+     /// The isolate this entry's ops belong to, so `abandon` can drop their
+     /// resolvers without a scope to reach the isolate through.
+-    runtime_state: Arc<ActorRuntimeState>,
++    runtime_state: Option<Arc<ActorRuntimeState>>,
++    native: Option<native_worker::Execution>,
+ }
+ 
+ impl InFlight {
+@@ -2812,6 +2824,7 @@ impl InFlight {
+     /// handler's. A handler that threw is recorded by `settle`, which
+     /// knows that it did, before it reaches this.
+     fn fail(&mut self, error: anyhow::Error) {
++        self.native.take();
+         if let Some(reply) = self.reply.take() {
+             if self.trace.is_some() {
+                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
+@@ -2935,13 +2948,23 @@ impl InFlight {
+     /// continues after the client has been served and is not charged for the
+     /// time the handler already spent.
+     pub fn remaining(&self, budget: Duration) -> Option<Duration> {
+-        self.reply
+-            .is_some()
+-            .then(|| budget.saturating_sub(self.started.elapsed()))
++        self.reply.is_some().then(|| {
++            let budget = if self.native.is_some() && self.scope.is_some() {
++                budget.min(Duration::from_secs(30))
++            } else {
++                budget
++            };
++            budget.saturating_sub(self.started.elapsed())
++        })
+     }
+ 
+     /// Give up on a handler that will not settle.
+     pub fn time_out(&mut self, budget: Duration) {
++        let budget = if self.native.is_some() && self.scope.is_some() {
++            budget.min(Duration::from_secs(30))
++        } else {
++            budget
++        };
+         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+     }
+ 
+@@ -2988,7 +3011,11 @@ impl InFlight {
+         if self.ops.is_empty() {
+             return;
+         }
+-        let mut promises = self.runtime_state.promises.lock().unwrap();
++        let Some(state) = &self.runtime_state else {
++            self.ops.clear();
++            return;
++        };
++        let mut promises = state.promises.lock().unwrap();
+         for id in self.ops.drain() {
+             promises.remove(&id);
+         }
+@@ -3174,7 +3201,7 @@ pub(crate) fn current_trace_ids(scope: &mut v8::PinScope) -> Option<crate::telem
+ /// isolate goes through one of these, and none of them may be held across an
+ /// await: the caller takes the pool's async permit first, runs a turn, and
+ /// leaves.
+-impl Worker {
++impl JsWorker {
+     /// Run a request's first turn.
+     ///
+     /// Returns what is now in flight — `None` when nothing is, the reply
+@@ -3204,7 +3231,11 @@ impl Worker {
+                 // A handler that returned an already-resolved promise is
+                 // finished before it ever suspends, and must not wait for an
+                 // op it will never start.
+-                let ops = finish_turn(tc, &mut entry);
++                let ops = if entry.promise.is_some() {
++                    finish_turn(tc, &mut entry)
++                } else {
++                    Vec::new()
++                };
+                 (Some(*entry), ops)
+             }
+             Begun::Threw(answer) => {
+@@ -3406,8 +3437,9 @@ fn begin<'s>(
+         Ok((promise, active_request_id)) => {
+             tc.perform_microtask_checkpoint();
+             let entry = InFlight {
+-                runtime_state: actor_runtime_state(tc),
+-                promise: v8::Global::new(tc, promise),
++                runtime_state: Some(actor_runtime_state(tc)),
++                native: None,
++                promise: Some(v8::Global::new(tc, promise)),
+                 context,
+                 scope: None,
+                 writes_before: None,
+@@ -3474,8 +3506,9 @@ fn begin_entrypoint_rpc(
+         Ok(promise) => {
+             tc.perform_microtask_checkpoint();
+             let entry = InFlight {
+-                runtime_state: actor_runtime_state(tc),
+-                promise: v8::Global::new(tc, promise),
++                runtime_state: Some(actor_runtime_state(tc)),
++                native: None,
++                promise: Some(v8::Global::new(tc, promise)),
+                 context,
+                 scope: None,
+                 writes_before: None,
+@@ -3704,8 +3737,9 @@ fn begin_queue(
+         Ok(promise) => {
+             tc.perform_microtask_checkpoint();
+             let entry = InFlight {
+-                runtime_state: actor_runtime_state(tc),
+-                promise: v8::Global::new(tc, promise),
++                runtime_state: Some(actor_runtime_state(tc)),
++                native: None,
++                promise: Some(v8::Global::new(tc, promise)),
+                 context,
+                 scope: None,
+                 writes_before: None,
+@@ -3854,8 +3888,9 @@ fn start_cell_event<'s>(
+         Ok(promise) => {
+             tc.perform_microtask_checkpoint();
+             let entry = InFlight {
+-                runtime_state: runtime_state.clone(),
+-                promise: v8::Global::new(tc, promise),
++                runtime_state: Some(runtime_state.clone()),
++                native: None,
++                promise: Some(v8::Global::new(tc, promise)),
+                 context,
+                 scope: Some(scope.to_string()),
+                 writes_before,
+@@ -3895,8 +3930,9 @@ fn start_cell_event<'s>(
+                 let promise = resolved_promise(tc, undefined)
+                     .expect("a finishing cell event can create a resolved promise");
+                 Begun::Running(Box::new(InFlight {
+-                    runtime_state,
+-                    promise: v8::Global::new(tc, promise),
++                    runtime_state: Some(runtime_state),
++                    native: None,
++                    promise: Some(v8::Global::new(tc, promise)),
+                     context,
+                     scope: Some(scope.to_string()),
+                     writes_before,
+@@ -4278,7 +4314,13 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight) {
+ /// `waitUntil` work once that settles too.
+ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
+     if entry.reply.is_some() {
+-        let promise = v8::Local::new(tc, &entry.promise);
++        let promise = v8::Local::new(
++            tc,
++            entry
++                .promise
++                .as_ref()
++                .expect("pending JS answer has a promise"),
++        );
+         match promise.state() {
+             v8::PromiseState::Pending => {}
+             v8::PromiseState::Fulfilled => {
+@@ -4384,7 +4426,7 @@ enum Started<'s> {
+     Threw,
+ }
+ 
+-impl Worker {
++impl JsWorker {
+     /// Compile the worker module, wire the DO harness, and extract the entry
+     /// `fetch`. `do_classes` come from the manifest; `bindings` maps a binding
+     /// name to a DO class name (from wrangler metadata).
+@@ -4392,11 +4434,11 @@ impl Worker {
+     /// The runtime builds a `WorkerConfig` directly. This cfg-gated helper
+     /// constructs the same value from individual options.
+     #[cfg(celld_internal_tests)]
+-    pub fn load(options: WorkerConfigOptions) -> Result<Worker> {
++    pub fn load(options: WorkerConfigOptions) -> Result<JsWorker> {
+         Self::load_config(Arc::new(WorkerConfig::new(options)))
+     }
+ 
+-    pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
++    pub fn load_config(config: Arc<WorkerConfig>) -> Result<JsWorker> {
+         let src = config.src.as_str();
+         let script_name = config.script_name.as_str();
+         let do_classes = config.do_classes.as_slice();
+@@ -4630,7 +4672,7 @@ impl Worker {
+             }
+             (v8::Global::new(scope, context), v8::Global::new(scope, f))
+         };
+-        Ok(Worker {
++        Ok(JsWorker {
+             inner: Some(WorkerIsolate {
+                 // Every setup scope above has closed, so nothing is entered
+                 // on top of this isolate and it can be handed over.
+@@ -6294,7 +6336,7 @@ fn op_fetch(
+         }
+     };
+     let raw_headers = args.get(3).to_rust_string_lossy(scope);
+-    let mut headers: Vec<(String, String)> = match serde_json::from_str(&raw_headers) {
++    let headers: Vec<(String, String)> = match serde_json::from_str(&raw_headers) {
+         Ok(headers) => headers,
+         // Same failure as the body: dropping the headers silently sent an
+         // unauthenticated, unrouted request in place of the real one.
+@@ -6306,21 +6348,63 @@ fn op_fetch(
+         }
+     };
+     let redirect = args.get(4).to_rust_string_lossy(scope);
+-    let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
++    let body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
+         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+             Some(guard) => guard,
+             None => return loader_throw(scope, "fetch: the body stream is not owned"),
+         },
+         None => RequestBodyGuard(None),
+     };
+-    let client = if redirect == "manual" {
++    let future = outbound_fetch(
++        method,
++        url,
++        body,
++        headers,
++        redirect == "manual",
++        body_guard,
++        current_trace_ids(scope),
++    );
++    let id = asyncrt::enqueue(async move {
++        let resp = future.await?;
++        let status = resp.status().as_u16();
++        let headers = resp
++            .headers()
++            .iter()
++            .map(|(k, v)| {
++                (
++                    k.as_str().to_owned(),
++                    v.to_str().unwrap_or_default().to_owned(),
++                )
++            })
++            .collect::<Vec<_>>();
++        let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
++        register_http_stream(stream_id, HttpStreamSource::Response(resp));
++        Ok(
++            serde_json::json!({"status": status, "streamId": stream_id, "headers": headers})
++                .to_string(),
++        )
++    });
++    rv.set(promise_for(scope, id));
++}
++
++/// Shared native HTTP operation. Call while the event context and storage are
++/// installed: durability is sampled here, before the future can leave the turn.
++fn outbound_fetch(
++    method: String,
++    url: String,
++    body: Option<RequestBody>,
++    mut headers: Vec<(String, String)>,
++    manual_redirect: bool,
++    mut body_guard: RequestBodyGuard,
++    trace: Option<crate::telemetry::TraceIds>,
++) -> impl std::future::Future<Output = Result<reqwest::Response, String>> + Send {
++    let client = if manual_redirect {
+         HTTP_MANUAL.with(|client| client.clone())
+     } else {
+         HTTP.with(|client| client.clone())
+     };
+-    // The creating context, read here while JS is still running: the op
+-    // future resolves on whatever worker polls it, far from any CPED.
+-    let trace = current_trace_ids(scope);
++    // The caller captures trace and durability while its turn is installed;
++    // the future can subsequently be polled by any runtime thread.
+     // The child's ids are minted before the request leaves so the
+     // traceparent header carries them: whatever this fetch reaches can
+     // join the trace celld is part of.
+@@ -6339,7 +6423,7 @@ fn op_fetch(
+     // un-act. That covers a write this handler made and a value it only read,
+     // because the third party cannot tell the two apart.
+     let gate = egress_gate_request(celld_logic::Channel::Fetch);
+-    let id = asyncrt::enqueue(async move {
++    async move {
+         let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
+         let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
+             let mut span =
+@@ -6362,7 +6446,8 @@ fn op_fetch(
+         await_egress_gate(gate).await.inspect_err(|error| {
+             finish(false, None, Some(error.clone()));
+         })?;
+-        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
++        let m = reqwest::Method::from_bytes(method.as_bytes())
++            .map_err(|error| format!("invalid HTTP method: {error}"))?;
+         // a timeout bounds a black-hole host: the future settles (Err) instead
+         // of parking run_loop forever — the hang the Drop guard can't catch.
+         let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
+@@ -6406,31 +6491,14 @@ fn op_fetch(
+             Ok(resp) => {
+                 let status = resp.status().as_u16();
+                 finish(true, Some(status), None);
+-                let headers = resp
+-                    .headers()
+-                    .iter()
+-                    .map(|(name, value)| {
+-                        (
+-                            name.as_str().to_string(),
+-                            value.to_str().unwrap_or_default().to_string(),
+-                        )
+-                    })
+-                    .collect::<Vec<_>>();
+-                let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+-                register_http_stream(stream_id, HttpStreamSource::Response(resp));
+-                Ok(serde_json::json!({
+-                    "status": status, "streamId": stream_id, "headers": headers,
+-                })
+-                .to_string())
++                Ok(resp)
+             }
+             Err(e) => {
+                 finish(false, None, Some(format!("fetch: {e}")));
+                 Err(format!("fetch: {e}"))
+             }
+         }
+-    });
+-    let p = promise_for(scope, id);
+-    rv.set(p);
++    }
+ }
+ 
+ fn op_asset_fetch(
+@@ -7672,6 +7740,11 @@ fn op_test_queue_rearm_bounded(
+         QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
+     }
+ }
++#[path = "native_worker.rs"]
++mod native_worker;
++#[path = "worker.rs"]
++mod worker;
++pub use worker::Worker;
+ mod r2_ops;
+ mod storage_ops;
+ use storage_ops::{actor_runtime_state, throw_storage_error};
+diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
+index e2c290a..116b450 100644
+--- a/crates/celld/lib.rs
++++ b/crates/celld/lib.rs
+@@ -329,6 +329,8 @@ pub mod deploy;
+ pub mod dev;
+ pub mod drain_token;
+ pub mod env_vars;
++pub mod native;
++mod native_host;
+ pub mod s3_etag;
+ #[cfg(celld_internal_tests)]
+ #[allow(clippy::disallowed_methods)]
+diff --git a/crates/celld/main.rs b/crates/celld/main.rs
+index 4eef31a..427df8f 100644
+--- a/crates/celld/main.rs
++++ b/crates/celld/main.rs
+@@ -3056,6 +3056,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+     let mut settings = match action {
+         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+         Action::Dev(arguments) => return celld::dev::run(arguments).await,
++        Action::Types(arguments) => {
++            if !arguments.is_empty() {
++                anyhow::bail!("usage: celld types > celld.pyi");
++            }
++            print!(
++                "{}",
++                celld::native::runtime()
++                    .map(|r| r.types())
++                    .unwrap_or_default()
++            );
++            return Ok(());
++        }
+         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
+         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
+         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
+diff --git a/crates/celld/main/cli.rs b/crates/celld/main/cli.rs
+index e99903f..09a4404 100644
+--- a/crates/celld/main/cli.rs
++++ b/crates/celld/main/cli.rs
+@@ -41,6 +41,7 @@ pub(crate) enum Action {
+     },
+     Deploy(Vec<String>),
+     Dev(Vec<String>),
++    Types(Vec<String>),
+     Cell(Vec<String>),
+     D1(Vec<String>),
+     Kv(Vec<String>),
+@@ -76,6 +77,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
+         match action {
+             "deploy" => return Ok(Action::Deploy(arguments)),
+             "dev" => return Ok(Action::Dev(arguments)),
++            "types" => return Ok(Action::Types(arguments)),
+             "cell" => return Ok(Action::Cell(arguments)),
+             "d1" => return Ok(Action::D1(arguments)),
+             "kv" => return Ok(Action::Kv(arguments)),
+@@ -273,6 +275,7 @@ USAGE:
+   celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
++  celld types > runtime.types         Write types for the registered native runtime
+   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+diff --git a/crates/celld/native.rs b/crates/celld/native.rs
+new file mode 100644
+index 0000000..f0c30e4
+--- /dev/null
++++ b/crates/celld/native.rs
+@@ -0,0 +1,39 @@
++//! Register one statically linked native runtime before starting celld.
++//! The ordinary JavaScript worker path remains available alongside it.
++pub use celld_runtime::*;
++use std::{path::Path, sync::OnceLock};
++
++static RUNTIME: OnceLock<&'static dyn Runtime> = OnceLock::new();
++
++pub fn register(runtime: &'static dyn Runtime) -> anyhow::Result<()> {
++    RUNTIME
++        .set(runtime)
++        .map_err(|_| anyhow::anyhow!("native runtime already registered"))
++}
++pub fn runtime() -> Option<&'static dyn Runtime> {
++    RUNTIME.get().copied()
++}
++pub(crate) fn is_entry(entry: &str) -> bool {
++    runtime().is_some_and(|r| {
++        Path::new(entry)
++            .extension()
++            .is_some_and(|e| e == r.descriptor().extension)
++    })
++}
++pub(crate) fn is_artifact(source: &str) -> bool {
++    runtime().is_some_and(|r| source.starts_with(r.descriptor().artifact_prefix))
++}
++pub(crate) fn compile(source: &str) -> anyhow::Result<Box<dyn Program>> {
++    let runtime = runtime().ok_or_else(|| anyhow::anyhow!("native runtime is not registered"))?;
++    Ok(runtime.compile(source)?)
++}
++pub(crate) fn bundle(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
++    let source = std::fs::read_to_string(root.join(entry))?;
++    compile(&source)?;
++    Ok(format!(
++        "{}{}",
++        runtime().unwrap().descriptor().artifact_prefix,
++        source
++    )
++    .into_bytes())
++}
+diff --git a/crates/celld/native_host.rs b/crates/celld/native_host.rs
+new file mode 100644
+index 0000000..8d0169a
+--- /dev/null
++++ b/crates/celld/native_host.rs
+@@ -0,0 +1,186 @@
++//! Scoped native capabilities. Only the worker driver can choose the cell;
++//! dropping a turn rolls back its unfinished transactions.
++use crate::storage;
++use celld_runtime::{HostCall, HostReply};
++use serde_json::{json, Value};
++
++pub(crate) struct Host {
++    pub scope: Option<String>,
++    transactions: usize,
++}
++impl Host {
++    pub fn new(scope: Option<String>) -> Self {
++        Self {
++            scope,
++            transactions: 0,
++        }
++    }
++    pub fn in_transaction(&self) -> bool {
++        self.transactions > 0
++    }
++    pub fn handles(call: &HostCall) -> bool {
++        !matches!(
++            call,
++            HostCall::Sync | HostCall::Sleep(_) | HostCall::Fetch(_) | HostCall::CallObject { .. }
++        )
++    }
++    pub fn call(&mut self, call: HostCall) -> Result<(HostReply, Option<i64>), String> {
++        use HostCall::*;
++        match call {
++            Now => {
++                return Ok((
++                    HostReply::Timestamp(Some(
++                        std::time::SystemTime::now()
++                            .duration_since(std::time::UNIX_EPOCH)
++                            .map_err(|e| e.to_string())?
++                            .as_millis() as i64,
++                    )),
++                    None,
++                ))
++            }
++            Uuid => return Ok((HostReply::Value(json!(new_uuid()?)), None)),
++            Log(message) => {
++                tracing::info!(target: "native", "{message}");
++                return Ok((HostReply::Value(Value::Null), None));
++            }
++            _ => {}
++        }
++        let scope = self
++            .scope
++            .as_deref()
++            .ok_or("storage requires a durable object")?;
++        let mut alarm = None;
++        let value = match call {
++            Get(key) => {
++                let value = storage::get_stored(scope, &key).map_err(|e| e.to_string())?;
++                json!({"found":value.is_some(),"value":value.map(decode).transpose()?})
++            }
++            Put(key, value) => {
++                storage::put_json(scope, &key, &value).map_err(|e| e.to_string())?;
++                Value::Null
++            }
++            Delete(key) => json!(storage::delete(scope, &key).map_err(|e| e.to_string())?),
++            Clear => {
++                storage::delete_all_with_alarm(scope, false).map_err(|e| e.to_string())?;
++                Value::Null
++            }
++            List {
++                prefix,
++                limit,
++                reverse,
++            } => {
++                if limit > 1000 {
++                    return Err("list limit must be 0-1000".into());
++                }
++                Value::Object(
++                    storage::list_stored_with_options(
++                        scope,
++                        None,
++                        None,
++                        None,
++                        Some(&prefix),
++                        Some(limit),
++                        reverse,
++                    )
++                    .map_err(|e| e.to_string())?
++                    .into_iter()
++                    .map(|(k, v)| Ok((k, decode(v)?)))
++                    .collect::<Result<_, String>>()?,
++                )
++            }
++            Sql { query, bindings } => {
++                let (columns, rows, _) = storage::sql_exec(scope, &query, &bindings)?;
++                json!(rows
++                    .into_iter()
++                    .map(|row| columns
++                        .iter()
++                        .cloned()
++                        .zip(row)
++                        .collect::<serde_json::Map<_, _>>())
++                    .collect::<Vec<_>>())
++            }
++            GetAlarm => return Ok((HostReply::Timestamp(storage::get_alarm(scope)), None)),
++            SetAlarm(at) => {
++                alarm = storage::set_alarm(scope, at).map_err(|e| e.to_string())?;
++                Value::Null
++            }
++            DeleteAlarm => {
++                storage::delete_alarm(scope).map_err(|e| e.to_string())?;
++                Value::Null
++            }
++            BeginTransaction => {
++                if self.transactions >= 16 {
++                    return Err("transaction nesting limit exceeded".into());
++                }
++                storage::transaction_control(
++                    scope,
++                    "start",
++                    self.transactions > 0,
++                    &format!("cells_tx_{}", self.transactions),
++                )?;
++                self.transactions += 1;
++                Value::Null
++            }
++            CommitTransaction | RollbackTransaction => {
++                let depth = self
++                    .transactions
++                    .checked_sub(1)
++                    .ok_or("no open transaction")?;
++                alarm = storage::transaction_control(
++                    scope,
++                    if matches!(call, CommitTransaction) {
++                        "commit"
++                    } else {
++                        "rollback"
++                    },
++                    depth > 0,
++                    &format!("cells_tx_{depth}"),
++                )?;
++                self.transactions = depth;
++                Value::Null
++            }
++            _ => return Err("asynchronous capability requires the worker driver".into()),
++        };
++        Ok((HostReply::Value(value), alarm))
++    }
++}
++impl Drop for Host {
++    fn drop(&mut self) {
++        if let Some(scope) = &self.scope {
++            while self.transactions > 0 {
++                self.transactions -= 1;
++                let _ = storage::transaction_control(
++                    scope,
++                    "rollback",
++                    self.transactions > 0,
++                    &format!("cells_tx_{}", self.transactions),
++                );
++            }
++        }
++    }
++}
++fn decode(value: storage::StoredValue) -> Result<Value, String> {
++    match value {
++        storage::StoredValue::LegacyJson(json) => {
++            serde_json::from_str(&json).map_err(|e| e.to_string())
++        }
++        storage::StoredValue::V8(_) => Err(
++            "native storage expects JSON; this key contains a JavaScript structured clone".into(),
++        ),
++    }
++}
++fn new_uuid() -> Result<String, String> {
++    let mut bytes = [0u8; 16];
++    getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
++    bytes[6] = (bytes[6] & 0x0f) | 0x40;
++    bytes[8] = (bytes[8] & 0x3f) | 0x80;
++    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
++    Ok(format!(
++        "{}-{}-{}-{}-{}",
++        &hex[..8],
++        &hex[8..12],
++        &hex[12..16],
++        &hex[16..20],
++        &hex[20..]
++    ))
++}
+diff --git a/crates/celld/native_worker.rs b/crates/celld/native_worker.rs
+new file mode 100644
+index 0000000..a082d7d
+--- /dev/null
++++ b/crates/celld/native_worker.rs
+@@ -0,0 +1,748 @@
++//! Native worker host. No V8 isolate, JavaScript bootstrap, promise,
++//! or value conversion is involved in a native invocation. The shared driver
++//! owns asynchronous futures; this backend only runs bounded interpreter turns.
++use super::*;
++use crate::native_host::Host;
++use celld_runtime::{self as api, Failure, HostCall, HostReply, Step};
++use serde_json::{json, Value};
++
++const BODY_LIMIT: usize = 1024 * 1024;
++
++pub struct Worker {
++    config: Arc<WorkerConfig>,
++    program: Box<dyn api::Program>,
++    env: Value,
++    cells: storage::Cells,
++    live: Arc<()>,
++}
++
++struct InputGuard {
++    scope: String,
++    event: u64,
++}
++impl InputGuard {
++    fn acquire(scope: &str) -> Self {
++        let event = NEXT_GATE_EVENT.fetch_add(1, Ordering::Relaxed);
++        assert!(
++            cell_gates()
++                .lock()
++                .unwrap()
++                .entry(scope.to_owned())
++                .or_default()
++                .acquire(event),
++            "native turn delivered behind a closed gate"
++        );
++        Self {
++            scope: scope.to_owned(),
++            event,
++        }
++    }
++}
++impl Drop for InputGuard {
++    fn drop(&mut self) {
++        let mut gates = cell_gates().lock().unwrap();
++        if let Some(gate) = gates.get_mut(&self.scope) {
++            gate.release(self.event);
++        }
++        // Release and wake under the same lock used by cell_gate_wait.
++        wake_gate_waiters(&self.scope, Ok(()));
++    }
++}
++
++struct Incoming {
++    url: String,
++    method: String,
++    headers: Vec<(String, String)>,
++}
++
++pub(super) struct Execution {
++    session: Option<Box<dyn api::Execution>>,
++    host: Host,
++    input: Option<Incoming>,
++    _gate: Option<InputGuard>,
++    _live: Arc<()>,
++}
++
++impl Worker {
++    pub fn load_config(config: Arc<WorkerConfig>) -> Result<Self> {
++        let program = config
++            .native_program
++            .get_or_init(|| {
++                let runtime = crate::native::runtime().expect("registered native runtime");
++                runtime
++                    .compile(
++                        config
++                            .src
++                            .strip_prefix(runtime.descriptor().artifact_prefix)
++                            .expect("native artifact"),
++                    )
++                    .map(Mutex::new)
++                    .map_err(|e| e.to_string())
++            })
++            .as_ref()
++            .map_err(|e| anyhow!(e.clone()))?
++            .lock()
++            .unwrap()
++            .fork();
++        for class in &config.do_classes {
++            anyhow::ensure!(
++                program.classes().iter().any(|name| name == class),
++                "unknown Native runtime durable class: {class}"
++            );
++        }
++        let mut env: serde_json::Map<String, Value> = config
++            .vars
++            .iter()
++            .map(|(k, v)| (k.clone(), json!(v)))
++            .collect();
++        if let Some(extra) = &config.loader_env {
++            for (key, value) in serde_json::from_str::<serde_json::Map<String, Value>>(extra)? {
++                if value.is_string() {
++                    env.insert(key, value);
++                } else {
++                    env.remove(&key);
++                }
++            }
++        }
++        Ok(Self {
++            program,
++            config,
++            env: Value::Object(env),
++            cells: Default::default(),
++            live: Arc::new(()),
++        })
++    }
++
++    pub fn own_cell(
++        &mut self,
++        scope: &str,
++        authority: Option<CellStorage<'_>>,
++    ) -> Result<Option<i64>> {
++        let _cells = self.cells.install();
++        match authority {
++            Some(authority) => {
++                let class = scope
++                    .split_once(':')
++                    .map(|(class, _)| class)
++                    .ok_or_else(|| anyhow!("invalid durable scope"))?;
++                anyhow::ensure!(
++                    self.program.classes().iter().any(|name| name == class),
++                    "unknown Native runtime durable class"
++                );
++                storage::open_at_epoch(
++                    scope,
++                    authority.path,
++                    authority.epoch,
++                    self.config.compat.sqlite_vec,
++                )?;
++                if let Some(name) = storage::get_actor_name(scope)? {
++                    self.validate_name(scope, &name)?;
++                }
++                Ok(storage::get_alarm(scope))
++            }
++            None => {
++                storage::close(scope);
++                Ok(None)
++            }
++        }
++    }
++    fn validate_name(&self, scope: &str, name: &str) -> Result<()> {
++        let (class, id) = scope
++            .split_once(':')
++            .ok_or_else(|| anyhow!("invalid durable scope"))?;
++        let key = namespace_key(&self.config.script_name, class);
++        let expected = durable_object_id_hex(&durable_object_id_for_name(&key, name));
++        anyhow::ensure!(
++            id == expected,
++            "actor name does not match Durable Object ID for {scope}"
++        );
++        Ok(())
++    }
++    pub fn set_id_name(&mut self, scope: &str, name: &str) -> Result<()> {
++        let _cells = self.cells.install();
++        self.validate_name(scope, name)?;
++        storage::set_actor_name(scope, name)?;
++        Ok(())
++    }
++    pub fn take_alarm_moves(&mut self) -> Vec<(String, i64)> {
++        let _cells = self.cells.install();
++        storage::take_alarm_moves()
++    }
++
++    fn entry(
++        &self,
++        reply: Answer,
++        scope: Option<String>,
++        request_id: Option<RequestId>,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> InFlight {
++        let context = IoContext::new();
++        let writes_before = scope.as_deref().and_then(storage::write_position);
++        context.begin_event();
++        if let Some(scope) = &scope {
++            context
++                .egress
++                .lock()
++                .unwrap()
++                .push((scope.clone(), writes_before.unwrap_or(0)));
++        }
++        let gate = scope.as_deref().map(InputGuard::acquire);
++        InFlight {
++            promise: None,
++            runtime_state: None,
++            context,
++            writes_before,
++            request_id,
++            active_request_id: None,
++            reply: Some(reply),
++            gated_reply: None,
++            background: None,
++            ops: Default::default(),
++            alarm: None,
++            started: Instant::now(),
++            trace,
++            failure: None,
++            native: Some(Execution {
++                session: None,
++                host: Host::new(scope.clone()),
++                input: None,
++                _gate: gate,
++                _live: self.live.clone(),
++            }),
++            scope,
++        }
++    }
++
++    pub fn turn_begin(
++        &mut self,
++        job: crate::WorkerJob,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> (Option<InFlight>, Vec<Op>) {
++        let _cells = self.cells.install();
++        let (url, method, body, headers, request_id, reply) = match job {
++            crate::WorkerJob::Fetch {
++                url,
++                method,
++                body,
++                headers,
++                request_id,
++                reply,
++                ..
++            } => (url, method, body, headers, request_id, reply),
++            crate::WorkerJob::Rpc { reply, .. } => {
++                let _ = reply.send(Err(anyhow!(
++                    "Native runtime functions are exposed as POST handlers"
++                )));
++                return (None, vec![]);
++            }
++            crate::WorkerJob::Queue { reply, .. } => {
++                let _ = reply.send(Err(anyhow!(
++                    "Native runtime queue consumers are not supported"
++                )));
++                return (None, vec![]);
++            }
++        };
++        self.begin_fetch(url, method, body, headers, request_id, reply, None, trace)
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn begin_fetch(
++        &self,
++        url: String,
++        method: String,
++        body: RequestBody,
++        headers: Vec<(String, String)>,
++        request_id: Option<RequestId>,
++        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
++        scope: Option<String>,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> (Option<InFlight>, Vec<Op>) {
++        if Arc::strong_count(&self.live) > 256 {
++            let _ = reply.send(Ok(response(
++                self.program.error_response(
++                    Failure {
++                        status: 503,
++                        code: "overloaded".into(),
++                        message: "native invocation capacity exceeded".into(),
++                    },
++                    false,
++                ),
++                None,
++            )));
++            return (None, vec![]);
++        }
++        let mut entry = self.entry(Answer::Fetch(reply), scope, request_id, trace);
++        let _context = CurrentGuard::enter(entry.context.clone());
++        if take_request_cancellation(request_id) {
++            entry.fail(anyhow!("The client has disconnected"));
++            return (Some(entry), vec![]);
++        }
++        let input = Incoming {
++            url,
++            method,
++            headers,
++        };
++        let result = match body {
++            RequestBody::Bytes(body) => self.http(&mut entry, input, &body),
++            RequestBody::Stream(id) => {
++                entry.context.own_body_stream(id);
++                entry.native.as_mut().unwrap().input = Some(input);
++                match take_body_stream(id) {
++                    Ok(stream) => {
++                        asyncrt::enqueue(async move { collect(stream).await });
++                        Ok(None)
++                    }
++                    Err(error) => Err(error.into()),
++                }
++            }
++        };
++        self.process(&mut entry, result);
++        let ops = adopt(&mut entry);
++        (Some(entry), ops)
++    }
++
++    fn http(
++        &self,
++        entry: &mut InFlight,
++        input: Incoming,
++        body: &[u8],
++    ) -> Result<Option<Step>, Failure> {
++        if body.len() > BODY_LIMIT {
++            return Err(body_limit());
++        }
++        let object = self.object(entry.scope.as_deref())?;
++        let (session, event) = self.program.start(api::Invocation {
++            request: api::Request {
++                url: input.url,
++                method: input.method,
++                headers: input.headers,
++                body: body.to_vec(),
++            },
++            object,
++            alarm: false,
++            env: self.env.clone(),
++        })?;
++        entry.native.as_mut().unwrap().session = Some(session);
++        Ok(Some(event))
++    }
++    fn object(&self, scope: Option<&str>) -> Result<Option<api::Object>, Failure> {
++        scope
++            .map(|scope| {
++                let class = scope
++                    .split_once(':')
++                    .ok_or("invalid durable scope")?
++                    .0
++                    .to_owned();
++                let id = storage::get_actor_name(scope)
++                    .map_err(|e| e.to_string())?
++                    .ok_or("native durable objects require a named ID")?;
++                Ok(api::Object { class, id })
++            })
++            .transpose()
++    }
++
++    pub fn turn_begin_cell(
++        &mut self,
++        job: CellJob,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> (Option<InFlight>, Vec<Op>) {
++        let _cells = self.cells.install();
++        if Arc::strong_count(&self.live) > 256 {
++            job.fail(anyhow!("Native runtime invocation capacity exceeded"));
++            return (None, vec![]);
++        }
++        let (scope, answer, alarm) = match job {
++            CellJob::Fetch {
++                scope,
++                name,
++                url,
++                method,
++                body,
++                headers,
++                request_id,
++                reply,
++                ..
++            } => {
++                if let Some(name) = name {
++                    if let Err(error) = self.set_id_name(&scope, &name) {
++                        let _ = reply.send(Err(error));
++                        return (None, vec![]);
++                    }
++                }
++                return self.begin_fetch(
++                    url,
++                    method,
++                    body,
++                    headers,
++                    request_id,
++                    reply,
++                    Some(scope),
++                    trace,
++                );
++            }
++            CellJob::Alarm {
++                scope,
++                scheduled_ms,
++                claim: _,
++                reply,
++            } => {
++                let now = unix_now_ms();
++                if now < scheduled_ms {
++                    let _ = reply.send(Err(anyhow!("alarm dispatched before its deadline")));
++                    return (None, vec![]);
++                }
++                let Some((scheduled, _retry)) = storage::due_alarm_entry(&scope, now) else {
++                    let _ = reply.send(Ok((storage::get_alarm(&scope), None)));
++                    return (None, vec![]);
++                };
++                storage::begin_alarm_handler(&scope, scheduled);
++                (
++                    scope,
++                    Answer::Alarm(reply),
++                    Some(AlarmClaim { now_ms: now }),
++                )
++            }
++            job => {
++                job.fail(anyhow!(
++                    "Native runtime durable objects expose methods and alarms"
++                ));
++                return (None, vec![]);
++            }
++        };
++        let mut entry = self.entry(answer, Some(scope.clone()), None, trace);
++        entry.alarm = alarm;
++        let _context = CurrentGuard::enter(entry.context.clone());
++        let result = (|| {
++            let (session, event) = self.program.start(api::Invocation {
++                request: api::Request {
++                    url: "http://native.internal/alarm".into(),
++                    method: "POST".into(),
++                    headers: vec![],
++                    body: vec![],
++                },
++                object: self.object(Some(&scope))?,
++                alarm: true,
++                env: self.env.clone(),
++            })?;
++            entry.native.as_mut().unwrap().session = Some(session);
++            Ok(Some(event))
++        })();
++        self.process(&mut entry, result);
++        let ops = adopt(&mut entry);
++        (Some(entry), ops)
++    }
++
++    pub fn turn_deliver(
++        &mut self,
++        entry: &mut InFlight,
++        op: u64,
++        result: Result<asyncrt::OpOut, String>,
++    ) -> Vec<Op> {
++        let _cells = self.cells.install();
++        let _context = CurrentGuard::enter(entry.context.clone());
++        entry.ops.remove(&op);
++        if take_request_cancellation(entry.request_id) {
++            self.turn_cancel(entry);
++            return vec![];
++        }
++        let Some(execution) = entry.native.as_mut() else {
++            return vec![];
++        };
++        let result = if let Some(input) = execution.input.take() {
++            match result {
++                Ok(asyncrt::OpOut::Bytes(body)) => self.http(entry, input, &body),
++                Err(error) if error == "body exceeds 1 MiB" => Err(body_limit()),
++                Err(error) => Err(error.into()),
++                _ => Err("invalid native body result".into()),
++            }
++        } else {
++            let session = execution.session.as_mut().expect("suspended session");
++            match result {
++                Ok(asyncrt::OpOut::Native(reply)) => session.resume(reply),
++                Err(error) => session.resume(HostReply::Error(error)),
++                _ => Err("invalid native operation result".into()),
++            }
++            .map(Some)
++        };
++        self.process(entry, result);
++        adopt(entry)
++    }
++
++    fn process(&self, entry: &mut InFlight, result: Result<Option<Step>, Failure>) {
++        let result = result.and_then(|event| match event {
++            Some(event) => self.drive(entry, event),
++            None => Ok(None),
++        });
++        match result {
++            Ok(Some(event)) => self.finish(entry, Ok(event)),
++            Err(error) => self.finish(entry, Err(error)),
++            Ok(None) => {}
++        }
++    }
++    fn drive(&self, entry: &mut InFlight, mut event: Step) -> Result<Option<Step>, Failure> {
++        loop {
++            let execution = entry.native.as_mut().expect("live invocation");
++            let Step::Call(call) = event else {
++                if execution.host.in_transaction() {
++                    return Err("unclosed transaction".into());
++                }
++                return Ok(Some(event));
++            };
++            let reply = if Host::handles(&call) {
++                match execution.host.call(call) {
++                    Ok((reply, alarm)) => {
++                        if let (Some(scope), Some(at)) = (&execution.host.scope, alarm) {
++                            if at >= 0 {
++                                spawn_arm_gate(scope, at, Some(entry.context.clone()));
++                            }
++                        }
++                        reply
++                    }
++                    Err(error) => HostReply::Error(error),
++                }
++            } else if execution.host.in_transaction() {
++                HostReply::Error("external I/O is not allowed inside a storage transaction".into())
++            } else {
++                match self.suspend(entry, call) {
++                    Ok(()) => return Ok(None),
++                    Err(error) => HostReply::Error(error),
++                }
++            };
++            event = entry
++                .native
++                .as_mut()
++                .unwrap()
++                .session
++                .as_mut()
++                .expect("running session")
++                .resume(reply)?;
++        }
++    }
++
++    fn suspend(&self, entry: &mut InFlight, call: HostCall) -> Result<(), String> {
++        match call {
++            HostCall::Sync => {
++                if entry.scope.is_none() {
++                    return Err("storage requires a durable object".into());
++                }
++                let gate = egress_gate_request(celld_logic::Channel::Response);
++                asyncrt::enqueue(async move {
++                    await_egress_gate(gate).await?;
++                    Ok(asyncrt::OpOut::Native(HostReply::Value(Value::Null)))
++                });
++            }
++            HostCall::Sleep(duration) => {
++                if duration > Duration::from_secs(30) {
++                    return Err("sleep exceeds 30 seconds".into());
++                }
++                asyncrt::enqueue(async move {
++                    asyncrt::sleep(duration).await;
++                    Ok(asyncrt::OpOut::Native(HostReply::Value(Value::Null)))
++                });
++            }
++            HostCall::Fetch(request) => {
++                if self.config.egress == EgressPolicy::Deny {
++                    return Err(
++                        "This worker is not permitted to access the internet via fetch".into(),
++                    );
++                }
++                let api::Request {
++                    url,
++                    method,
++                    headers,
++                    body,
++                } = request;
++                if body.len() > BODY_LIMIT {
++                    return Err("fetch body exceeds 1 MiB".into());
++                }
++                let body = Some(RequestBody::Bytes(body.into()));
++                let future = outbound_fetch(
++                    method,
++                    url,
++                    body,
++                    headers,
++                    false,
++                    RequestBodyGuard(None),
++                    entry.trace,
++                );
++                asyncrt::enqueue(async move {
++                    let response = future.await?;
++                    let status = response.status().as_u16();
++                    let headers = response
++                        .headers()
++                        .iter()
++                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
++                        .collect();
++                    let body =
++                        collect(Box::pin(response.bytes_stream().map(|chunk| {
++                            chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())
++                        })))
++                        .await?;
++                    Ok(asyncrt::OpOut::Native(HostReply::Fetch(api::Response {
++                        status,
++                        headers,
++                        body,
++                    })))
++                });
++            }
++            HostCall::CallObject {
++                object,
++                method,
++                body,
++            } => {
++                let class = &object.class;
++                if !self.program.classes().contains(class) {
++                    return Err("unknown durable class".into());
++                }
++                if body.len() > BODY_LIMIT {
++                    return Err("object arguments exceed 1 MiB".into());
++                }
++                let name = object.id;
++                if method.starts_with('_') || method == "alarm" {
++                    return Err("unknown public method".into());
++                }
++                let key = namespace_key(&self.config.script_name, class);
++                let id = durable_object_id_hex(&durable_object_id_for_name(&key, &name));
++                let scope = format!("{class}:{id}");
++                if entry.scope.as_deref() == Some(&scope) {
++                    return Err("call same-object methods through self".into());
++                }
++                let gate = egress_gate_request(celld_logic::Channel::CellRpc);
++                let order = Some(enter_call_order(entry.context.clone(), &scope));
++                let request_id = next_do_request_id();
++                let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
++                do_call_cancels()
++                    .lock()
++                    .unwrap()
++                    .insert(request_id, cancel_sender);
++                let mut cancel_guard = DoCallCancelGuard::new(request_id);
++                let (reply, receive) = tokio::sync::oneshot::channel();
++                let body = RequestBody::Bytes(body.into());
++                let request = DoCallReq {
++                    request_id: Some(request_id),
++                    cancel: Some(cancel),
++                    deliver_abort_to_handler: false,
++                    scope,
++                    name: Some(name),
++                    url: format!("http://native.internal/{method}"),
++                    method: "POST".into(),
++                    body_guard: RequestBodyGuard::of(&body),
++                    body,
++                    headers: vec![("content-type".into(), "application/json".into())],
++                    reply,
++                    order,
++                    parent: entry.trace,
++                };
++                asyncrt::enqueue(async move {
++                    gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
++                    let response = receive
++                        .await
++                        .map_err(|_| "durable call dropped".to_string())?
++                        .map_err(|e| e.to_string())?;
++                    cancel_guard.disarm();
++                    if response.body.len() > BODY_LIMIT {
++                        return Err("object result exceeds 1 MiB".into());
++                    }
++                    Ok(asyncrt::OpOut::Native(HostReply::Object(api::Response {
++                        status: response.status,
++                        headers: response.headers,
++                        body: response.body,
++                    })))
++                });
++            }
++            _ => return Err("unknown asynchronous capability".into()),
++        }
++        Ok(())
++    }
++
++    fn finish(&self, entry: &mut InFlight, result: Result<Step, Failure>) {
++        // Drop/rollback while this worker's storage is installed. A suspended
++        // invocation never retains an open SQL transaction.
++        entry.native.take();
++        let result = match storage_error(entry.scope.as_deref()) {
++            Some(error) => Err(error.into()),
++            None => result,
++        };
++        if let Err(error) = &result {
++            entry.failure = Some(crate::telemetry::cap_error(error.to_string()));
++        }
++        entry.context.end_event();
++        let gates = entry.context.take_arm_gates();
++        let Some(answer) = entry.reply.take() else {
++            return;
++        };
++        entry.gated_reply = match answer {
++            Answer::Fetch(reply) => {
++                let result = match result {
++                    Ok(Step::Return(r)) => Ok(response(r, entry.write_delta())),
++                    Ok(Step::Call(_)) => Err(anyhow!(
++                        "native execution completed with a pending host call"
++                    )),
++                    Err(error) => Ok(response(
++                        self.program.error_response(error, entry.scope.is_some()),
++                        entry.write_delta(),
++                    )),
++                };
++                send_answer_after_arm_gates(reply, result, gates)
++            }
++            Answer::Alarm(reply) => {
++                entry.settle_alarm(result.is_ok(), result.is_err());
++                let result = result
++                    .map(|_| {
++                        (
++                            entry.scope.as_deref().and_then(storage::get_alarm),
++                            entry.write_delta(),
++                        )
++                    })
++                    .map_err(anyhow::Error::from);
++                send_answer_after_arm_gates(reply, result, gates)
++            }
++            answer => answer.fail_with_arm_gates(anyhow!("invalid native answer"), gates),
++        };
++    }
++    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
++        let _cells = self.cells.install();
++        entry.fail(anyhow!("The client has disconnected"));
++        entry.context.end_event();
++        vec![]
++    }
++    pub fn turn_poll(&mut self, _entry: &mut InFlight) -> Vec<Op> {
++        vec![]
++    }
++    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) {
++        let _cells = self.cells.install();
++        entry.settle_alarm(false, false);
++    }
++}
++
++fn storage_error(scope: Option<&str>) -> Option<String> {
++    scope.and_then(storage::sql_critical_error)
++}
++fn body_limit() -> Failure {
++    Failure {
++        status: 413,
++        code: "body_too_large".into(),
++        message: "body exceeds 1 MiB".into(),
++    }
++}
++fn response(r: api::Response, write_position: Option<u64>) -> HttpResponse {
++    HttpResponse {
++        status: r.status,
++        headers: r.headers,
++        body: r.body,
++        stream: None,
++        websocket: None,
++        write_position,
++    }
++}
++async fn collect(mut stream: HttpChunkStream) -> Result<Vec<u8>, String> {
++    let mut body = Vec::new();
++    while let Some(chunk) = stream.next().await {
++        let chunk = chunk?;
++        if chunk.len() > BODY_LIMIT - body.len() {
++            return Err("body exceeds 1 MiB".into());
++        }
++        body.extend_from_slice(&chunk);
++    }
++    Ok(body)
++}
+diff --git a/crates/celld/protocol.rs b/crates/celld/protocol.rs
+index 9a65853..34b2718 100644
+--- a/crates/celld/protocol.rs
++++ b/crates/celld/protocol.rs
+@@ -291,9 +291,16 @@ fn valid_binding_name(name: &str) -> bool {
+ /// Reject a manifest requiring any feature this build does not support. Both
+ /// load paths (control-plane deployments and fleet pointer loads) must apply
+ /// the same gate, so it lives here beside the feature list.
++pub fn supported_deployment_features() -> impl Iterator<Item = &'static str> {
++    SUPPORTED_DEPLOYMENT_FEATURES
++        .iter()
++        .copied()
++        .chain(crate::native::runtime().map(|r| r.descriptor().required_feature))
++}
++
+ pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
+     for feature in required {
+-        if !SUPPORTED_DEPLOYMENT_FEATURES.contains(&feature.as_str()) {
++        if !supported_deployment_features().any(|supported| supported == feature) {
+             anyhow::bail!(
+                 "deployment requires feature {feature:?} this celld build does not support; upgrade celld"
+             );
+@@ -308,7 +315,7 @@ pub struct ModuleRef {
+     pub bytes: usize,
+     /// content hash of this module's bytes (hex, truncated)
+     pub sha256: String,
+-    /// Absent means UTF-8 source: the main module is ESM, siblings become
++    /// Absent means UTF-8 source: the main module selects its runtime, siblings become
+     /// text modules. `wasm` bytes become a module whose default export is a
+     /// compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+diff --git a/crates/celld/storage.rs b/crates/celld/storage.rs
+index c8cf8f5..673344c 100644
+--- a/crates/celld/storage.rs
++++ b/crates/celld/storage.rs
+@@ -2891,6 +2891,18 @@ pub fn put(scope: &str, key: &str, val: &str) {
+     });
+ }
+ 
++/// Store a native JSON value as TEXT, readable by every runtime's JSON path.
++pub fn put_json(scope: &str, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
++    let encoded = serde_json::to_string(value)?;
++    with(scope, |c| {
++        c.prepare_cached(KV_PUT_SQL)?
++            .execute(rusqlite::params![scope, key, encoded])
++            .map(|_| ())
++            .map_err(Into::into)
++    })
++    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
++}
++
+ pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
+     with(scope, |c| {
+         c.prepare_cached(KV_PUT_SQL)?
+diff --git a/crates/celld/worker.rs b/crates/celld/worker.rs
+new file mode 100644
+index 0000000..237057e
+--- /dev/null
++++ b/crates/celld/worker.rs
+@@ -0,0 +1,75 @@
++//! Runtime selection at materialization. Both engines use the same pool,
++//! request driver, admission, storage ownership, and durability gates.
++use super::*;
++
++pub enum Worker {
++    JavaScript(JsWorker),
++    Native(native_worker::Worker),
++}
++
++macro_rules! dispatch {
++    ($self:ident, $method:ident $(, $arg:expr)*) => {
++        match $self {
++            Self::JavaScript(worker) => worker.$method($($arg),*),
++            Self::Native(worker) => worker.$method($($arg),*),
++        }
++    };
++}
++
++impl Worker {
++    pub fn load_config(config: Arc<WorkerConfig>) -> Result<Self> {
++        if crate::native::is_artifact(&config.src) {
++            Ok(Self::Native(native_worker::Worker::load_config(config)?))
++        } else {
++            Ok(Self::JavaScript(JsWorker::load_config(config)?))
++        }
++    }
++    #[cfg(celld_internal_tests)]
++    pub fn load(options: WorkerConfigOptions) -> Result<Self> {
++        Self::load_config(Arc::new(WorkerConfig::new(options)))
++    }
++    pub fn turn_begin(
++        &mut self,
++        job: crate::WorkerJob,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> (Option<InFlight>, Vec<Op>) {
++        dispatch!(self, turn_begin, job, trace)
++    }
++    pub fn turn_begin_cell(
++        &mut self,
++        job: CellJob,
++        trace: Option<crate::telemetry::TraceIds>,
++    ) -> (Option<InFlight>, Vec<Op>) {
++        dispatch!(self, turn_begin_cell, job, trace)
++    }
++    pub fn turn_deliver(
++        &mut self,
++        entry: &mut InFlight,
++        op: u64,
++        result: Result<asyncrt::OpOut, String>,
++    ) -> Vec<Op> {
++        dispatch!(self, turn_deliver, entry, op, result)
++    }
++    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
++        dispatch!(self, turn_cancel, entry)
++    }
++    pub fn turn_poll(&mut self, entry: &mut InFlight) -> Vec<Op> {
++        dispatch!(self, turn_poll, entry)
++    }
++    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) {
++        dispatch!(self, turn_finish_alarm, entry)
++    }
++    pub fn own_cell(
++        &mut self,
++        cell: &str,
++        storage: Option<CellStorage<'_>>,
++    ) -> Result<Option<i64>> {
++        dispatch!(self, own_cell, cell, storage)
++    }
++    pub fn set_id_name(&mut self, scope: &str, name: &str) -> Result<()> {
++        dispatch!(self, set_id_name, scope, name)
++    }
++    pub fn take_alarm_moves(&mut self) -> Vec<(String, i64)> {
++        dispatch!(self, take_alarm_moves)
++    }
++}

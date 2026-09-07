@@ -1,0 +1,34 @@
+diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+index 421841b..9713681 100644
+--- a/crates/celld/Cargo.toml
++++ b/crates/celld/Cargo.toml
+@@ -24,7 +24,16 @@ disallowed_macros = "forbid"
+ name = "native_extension"
+ path = "../../../../tests/native_extension.rs"
+ 
++[features]
++monty = ["dep:celld-monty"]
++
++[[test]]
++name = "monty_native"
++path = "../../../../tests/monty_native.rs"
++required-features = ["monty"]
++
+ [dependencies]
++celld-monty = { path = "../../../../crates/monty-runtime", optional = true }
+ celld-runtime = { path = "../../../../crates/runtime-api" }
+ async-trait.workspace = true
+ chrono.workspace = true
+diff --git a/crates/celld/main.rs b/crates/celld/main.rs
+index 427df8f..a14903d 100644
+--- a/crates/celld/main.rs
++++ b/crates/celld/main.rs
+@@ -2986,6 +2986,8 @@ const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 8;
+ const LOCAL_CACHE_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+ 
+ fn main() -> anyhow::Result<()> {
++    #[cfg(feature = "monty")]
++    celld::native::register(&celld_monty::Monty)?;
+     celld::env_vars::validate()?;
+     // Parse the telemetry group once, before any command or runtime work.
+     // Its specialized values share the strict scalar parsers in env_vars.

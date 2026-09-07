@@ -1,0 +1,40 @@
+# Validation
+
+```sh
+cargo xtask test
+cargo xtask build
+python3 tools/monty-checks/e2e.py target/lab/celld
+python3 tools/storage-checks/probe.py target/lab/celld -v
+```
+
+`cargo xtask test` covers the standalone Monty interpreter and typed runtime
+boundary, a second runtime using the public extension API, native worker
+cancellation and capacity, deployment compilation, host configuration, cell
+placement, and reproducible patch preparation.
+
+The end-to-end test starts local celld processes and checks real HTTP responses,
+POST routing, dataclasses, buffered bytes, native fetch, durable calls,
+concurrency, transactions, SQL, alarms, cancellation, and disk recovery. Storage
+compatibility checks exercise conditional writes against strict local S3
+fixtures.
+
+Check the editor interface independently:
+
+```sh
+python3 -m pip install mypy==2.3.1
+MYPYPATH=crates/monty-runtime/src mypy --strict examples/monty/worker.py
+MYPYPATH=crates/monty-runtime/src mypy --strict tools/monty-checks/bench/worker.py
+```
+
+For a lightweight comparison against TypeScript workers:
+
+```sh
+python3 tools/monty-checks/bench.py target/lab/celld \
+  --seconds 1 --repeats 3 --concurrency 1 16 \
+  --output tools/monty-checks/bench/results-native.json
+```
+
+Every benchmark response is validated; errors abort the run. Both runtimes use
+the same binary, local HTTP, one stateless slot, and identical workloads.
+See the [benchmark report](../tools/monty-checks/bench/README.md) for results and
+measurement limitations. Streaming and remote iterators remain outside scope.

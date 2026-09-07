@@ -1,0 +1,16 @@
+[package]
+name = "celld-packing-checks"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Keep these focused checks independent of the full V8 runtime build.
+[workspace]
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[dependencies]
+anyhow = "=1.0.104"

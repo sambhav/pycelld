@@ -1,0 +1,23 @@
+[package]
+name = "celld-monty"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+autotests = false
+
+[[test]]
+name = "extension"
+path = "tests/extension.rs"
+
+[dependencies]
+celld-runtime = { path = "../runtime-api" }
+url = "2"
+percent-encoding = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+monty = { git = "https://github.com/pydantic/monty", rev = "af272c3116e2525249103f960b79086fd250bcef" }
+monty-types = { git = "https://github.com/pydantic/monty", rev = "af272c3116e2525249103f960b79086fd250bcef" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+ruff_python_ast = "=0.0.12"
+ruff_python_parser = "=0.0.12"
