@@ -116,7 +116,7 @@ async fn native_suspension_body_limits_and_cancellation_release_capacity() {
         Ok(vec![b'x'; 1024 * 1024]),
         Ok(vec![b'x']),
     ]));
-    let id = celld::js::register_body_stream(stream);
+    let id = celld::js::register_body_stream(stream).unwrap();
     let (job, reply) = request(RequestBody::Stream(id));
     let (entry, mut ops) = worker.turn_begin(job, None);
     let mut entry = entry.unwrap();

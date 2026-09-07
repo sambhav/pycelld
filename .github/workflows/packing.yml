@@ -14,5 +14,5 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal
       - run: cargo +1.98.1 xtask prepare
-      - name: Test configuration, packing, and retirement
+      - name: Test cell packing and retirement
         run: cargo +1.98.1 test --manifest-path tools/packing-checks/Cargo.toml --locked

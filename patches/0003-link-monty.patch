@@ -1,5 +1,5 @@
 diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
-index 421841b..9713681 100644
+index 38e21b0..83b4279 100644
 --- a/crates/celld/Cargo.toml
 +++ b/crates/celld/Cargo.toml
 @@ -24,7 +24,16 @@ disallowed_macros = "forbid"
@@ -20,10 +20,10 @@ index 421841b..9713681 100644
  async-trait.workspace = true
  chrono.workspace = true
 diff --git a/crates/celld/main.rs b/crates/celld/main.rs
-index 427df8f..a14903d 100644
+index feb5296..dd6e2ae 100644
 --- a/crates/celld/main.rs
 +++ b/crates/celld/main.rs
-@@ -2986,6 +2986,8 @@ const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 8;
+@@ -3494,6 +3494,8 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
  const LOCAL_CACHE_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
  
  fn main() -> anyhow::Result<()> {

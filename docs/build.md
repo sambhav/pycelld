@@ -9,7 +9,7 @@ command; `xtask` has no crate dependencies.
 | Input | Purpose |
 | --- | --- |
 | `upstream/repository` | Official upstream Git repository |
-| `upstream/revision` | Full pinned commit SHA; currently celld 0.4.0 |
+| `upstream/revision` | Full pinned commit SHA; currently celld 0.4.1 |
 | `patches/*.patch` | Patches applied in filename order |
 | `upstream/Cargo.lock` | Dependency lock for the generated celld workspace |
 | `Cargo.lock` | Dependency lock for the standalone runtime crates |
@@ -44,6 +44,12 @@ build utility. Run the HTTP end-to-end suite separately as described in
 [testing](testing.md).
 
 ## Runtime boundary
+
+The pin is celld [0.4.1](https://github.com/denoland/celld/releases/tag/v0.4.1).
+The native bridge carries response write/observed positions, gates sync against
+committed state at its activation epoch, honors paged SQLite restores, and
+retains upstream storage failure tracking. Monty's Python API remains unchanged;
+upstream's new embedded facets are not exposed to Python yet.
 
 The API follows the current bounded execution model:
 

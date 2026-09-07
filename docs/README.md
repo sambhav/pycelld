@@ -6,4 +6,4 @@
 - [Host configuration and native binaries](fork.md)
 
 Architecture and general operations are documented by
-[upstream celld](https://github.com/denoland/celld/tree/a52f9905425bc41134d817694bdc2c50bcc5e856/docs).
+[upstream celld](https://github.com/denoland/celld/tree/10cb1303dac710dcb3b557e318e08c855261f68b/docs).

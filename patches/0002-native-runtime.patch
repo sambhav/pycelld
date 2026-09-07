@@ -1,10 +1,10 @@
 diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
-index 487c753..421841b 100644
+index 6ac1049..38e21b0 100644
 --- a/crates/celld/Cargo.toml
 +++ b/crates/celld/Cargo.toml
 @@ -2,7 +2,7 @@
  name = "celld"
- version = "0.4.0"
+ version = "0.4.1"
  edition = "2021"
 -rust-version = "1.94.1"
 +rust-version = "1.95"
@@ -25,10 +25,10 @@ index 487c753..421841b 100644
  chrono.workspace = true
  aes.workspace = true
 diff --git a/crates/celld/asyncrt.rs b/crates/celld/asyncrt.rs
-index 33aaf33..ec6fc84 100644
+index 6702b31..c54aecd 100644
 --- a/crates/celld/asyncrt.rs
 +++ b/crates/celld/asyncrt.rs
-@@ -310,8 +310,9 @@ pub fn interval_at(start_ms: u64, period: Duration) -> Interval {
+@@ -434,8 +434,9 @@ pub fn interval_at(start_ms: u64, period: Duration) -> Interval {
      }
  }
  
@@ -40,7 +40,7 @@ index 33aaf33..ec6fc84 100644
      Bytes(Vec<u8>),
  }
 diff --git a/crates/celld/control_plane.rs b/crates/celld/control_plane.rs
-index 3a58931..f19cfb0 100644
+index f2f5aec..8011072 100644
 --- a/crates/celld/control_plane.rs
 +++ b/crates/celld/control_plane.rs
 @@ -1574,9 +1574,7 @@ fn presence_request(
@@ -55,10 +55,10 @@ index 3a58931..f19cfb0 100644
          .collect::<Vec<_>>()
          .join(",");
 diff --git a/crates/celld/deploy.rs b/crates/celld/deploy.rs
-index fdaf017..3965f2e 100644
+index 8de21e1..d6c9f1c 100644
 --- a/crates/celld/deploy.rs
 +++ b/crates/celld/deploy.rs
-@@ -436,13 +436,29 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+@@ -447,13 +447,29 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
          .filter(|path| !path.as_os_str().is_empty())
          .map(Path::to_path_buf)
          .unwrap_or_else(|| PathBuf::from("."));
@@ -89,7 +89,7 @@ index fdaf017..3965f2e 100644
              if project.no_bundle {
                  // Already bundled by the caller's toolchain. Read it as it is;
                  // running esbuild over a Vite build is what corrupts it. A
-@@ -462,9 +478,16 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+@@ -473,9 +489,16 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
          .transpose()?;
      let bundled_in = started.elapsed();
  
@@ -109,7 +109,7 @@ index fdaf017..3965f2e 100644
      let (mut modules, wasm_modules) = match bundle {
          Some(output) => (vec![(module_name.clone(), output.bundle)], output.wasm),
          None => (Vec::new(), Vec::new()),
-@@ -516,6 +539,15 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
+@@ -527,6 +550,15 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
          // partially deserializing the manifest and failing at worker load.
          required_features: {
              let mut features = Vec::new();
@@ -125,7 +125,7 @@ index fdaf017..3965f2e 100644
              if built_assets.is_some() {
                  features.push(FEATURE_ASSETS_V1.to_string());
              }
-@@ -1522,6 +1554,19 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
+@@ -1543,6 +1575,19 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
              );
          }
      }
@@ -146,28 +146,12 @@ index fdaf017..3965f2e 100644
      if main.is_some() {
          metadata.insert("main_module".into(), json!("index.js"));
 diff --git a/crates/celld/dev.rs b/crates/celld/dev.rs
-index 4059b7f..e2e9f6c 100644
+index 4767a88..356d972 100644
 --- a/crates/celld/dev.rs
 +++ b/crates/celld/dev.rs
-@@ -149,10 +149,11 @@ impl ProjectWatcher {
-                 .context("the project watcher stopped")?
-             {
-                 Ok(event)
--                    if event
--                        .paths
--                        .iter()
--                        .any(|path| !ignored_project_path(&self.project, path)) =>
-+                    if !event.kind.is_access()
-+                        && event
-+                            .paths
-+                            .iter()
-+                            .any(|path| !ignored_project_path(&self.project, path)) =>
-                 {
-                     return Ok(())
-                 }
-@@ -176,6 +177,8 @@ fn ignored_project_path(project: &Path, path: &Path) -> bool {
-         ".svn",
+@@ -254,6 +254,8 @@ fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> boo
          ".turbo",
+         ".wrangler",
          ".yarn",
 +        ".venv",
 +        "__pycache__",
@@ -175,10 +159,10 @@ index 4059b7f..e2e9f6c 100644
          "coverage",
          "node_modules",
 diff --git a/crates/celld/js.rs b/crates/celld/js.rs
-index 88c5c10..d8efcb9 100644
+index 397395d..3d6a740 100644
 --- a/crates/celld/js.rs
 +++ b/crates/celld/js.rs
-@@ -1485,6 +1485,9 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
+@@ -3583,6 +3583,9 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
              let s = v8::String::new(tc, &v).unwrap();
              r.resolve(tc, s.into());
          }
@@ -188,7 +172,7 @@ index 88c5c10..d8efcb9 100644
          Ok(asyncrt::OpOut::Bytes(b)) => {
              let v = bytes_value(tc, b);
              r.resolve(tc, v);
-@@ -1788,6 +1791,10 @@ pub struct WorkerConfig {
+@@ -3997,6 +4000,10 @@ pub struct WorkerConfig {
      /// isolate built from it carries the value as a slot, so its host calls
      /// resolve against the deployment graph it was built with.
      pub generation: crate::generation::GenerationId,
@@ -199,7 +183,7 @@ index 88c5c10..d8efcb9 100644
      /// The external (`node:*`/`cloudflare:*`) imports of `src`.
      ///
      /// The scan walks the whole bundle, which an esbuild artifact makes
-@@ -1852,7 +1859,11 @@ impl WorkerConfig {
+@@ -4061,7 +4068,11 @@ impl WorkerConfig {
              modules,
              compat,
          } = options;
@@ -212,7 +196,7 @@ index 88c5c10..d8efcb9 100644
          let module_imports = es_module_sources(&modules)
              .map(|(_name, source)| modules::scan_external_imports(source))
              .collect();
-@@ -1888,6 +1899,7 @@ impl WorkerConfig {
+@@ -4097,6 +4108,7 @@ impl WorkerConfig {
              loader_env: None,
              crons: Vec::new(),
              generation: 0,
@@ -220,8 +204,8 @@ index 88c5c10..d8efcb9 100644
              main_imports,
              module_imports,
          }
-@@ -1967,7 +1979,7 @@ pub struct CellStorage<'a> {
-     pub epoch: u64,
+@@ -4179,7 +4191,7 @@ pub struct CellStorage<'a> {
+     pub vfs: Option<&'a str>,
  }
  
 -pub struct Worker {
@@ -229,7 +213,7 @@ index 88c5c10..d8efcb9 100644
      inner: Option<WorkerIsolate>,
  }
  
-@@ -2094,7 +2106,7 @@ struct Entered<'s> {
+@@ -4306,7 +4318,7 @@ struct Entered<'s> {
      fetch: v8::Local<'s, v8::Function>,
  }
  
@@ -238,7 +222,7 @@ index 88c5c10..d8efcb9 100644
      type Target = WorkerIsolate;
  
      fn deref(&self) -> &Self::Target {
-@@ -2102,7 +2114,7 @@ impl std::ops::Deref for Worker {
+@@ -4314,7 +4326,7 @@ impl std::ops::Deref for Worker {
      }
  }
  
@@ -247,7 +231,7 @@ index 88c5c10..d8efcb9 100644
      fn deref_mut(&mut self) -> &mut Self::Target {
          self.inner.as_mut().expect("Worker isolate unavailable")
      }
-@@ -2654,10 +2666,9 @@ pub fn drop_next_gated_reply_task_for_test() {
+@@ -4900,10 +4912,9 @@ pub fn drop_next_gated_reply_task_for_test() {
  }
  
  pub struct InFlight {
@@ -261,7 +245,7 @@ index 88c5c10..d8efcb9 100644
      context: Arc<IoContext>,
      /// The cell this event belongs to, and `None` for stateless work.
      ///
-@@ -2694,7 +2705,8 @@ pub struct InFlight {
+@@ -4943,7 +4954,8 @@ pub struct InFlight {
      failure: Option<String>,
      /// The isolate this entry's ops belong to, so `abandon` can drop their
      /// resolvers without a scope to reach the isolate through.
@@ -271,15 +255,15 @@ index 88c5c10..d8efcb9 100644
  }
  
  impl InFlight {
-@@ -2812,6 +2824,7 @@ impl InFlight {
-     /// handler's. A handler that threw is recorded by `settle`, which
-     /// knows that it did, before it reaches this.
+@@ -5097,6 +5109,7 @@ impl InFlight {
+     /// it. A write a handler made before it ran out of budget is therefore
+     /// still an unproven commit with no barrier of its own.
      fn fail(&mut self, error: anyhow::Error) {
 +        self.native.take();
          if let Some(reply) = self.reply.take() {
-             if self.trace.is_some() {
+             if self.trace.is_some_and(|trace| trace.sampled) {
                  self.failure = Some(crate::telemetry::cap_error(error.to_string()));
-@@ -2935,13 +2948,23 @@ impl InFlight {
+@@ -5263,13 +5276,23 @@ impl InFlight {
      /// continues after the client has been served and is not charged for the
      /// time the handler already spent.
      pub fn remaining(&self, budget: Duration) -> Option<Duration> {
@@ -306,7 +290,7 @@ index 88c5c10..d8efcb9 100644
          self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
      }
  
-@@ -2988,7 +3011,11 @@ impl InFlight {
+@@ -5358,7 +5381,11 @@ impl InFlight {
          if self.ops.is_empty() {
              return;
          }
@@ -319,7 +303,7 @@ index 88c5c10..d8efcb9 100644
          for id in self.ops.drain() {
              promises.remove(&id);
          }
-@@ -3174,7 +3201,7 @@ pub(crate) fn current_trace_ids(scope: &mut v8::PinScope) -> Option<crate::telem
+@@ -5571,7 +5598,7 @@ pub(crate) fn current_trace_context(
  /// isolate goes through one of these, and none of them may be held across an
  /// await: the caller takes the pool's async permit first, runs a turn, and
  /// leaves.
@@ -328,7 +312,7 @@ index 88c5c10..d8efcb9 100644
      /// Run a request's first turn.
      ///
      /// Returns what is now in flight — `None` when nothing is, the reply
-@@ -3204,7 +3231,11 @@ impl Worker {
+@@ -5602,7 +5629,11 @@ impl Worker {
                  // A handler that returned an already-resolved promise is
                  // finished before it ever suspends, and must not wait for an
                  // op it will never start.
@@ -341,7 +325,16 @@ index 88c5c10..d8efcb9 100644
                  (Some(*entry), ops)
              }
              Begun::Threw(answer) => {
-@@ -3406,8 +3437,9 @@ fn begin<'s>(
+@@ -5764,7 +5795,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
+     // `settle`. Gate only a reply that the first `settle` can consume, so a
+     // long handler does not accumulate one resolved receiver on every turn.
+     let needs_facet_flush_gate = embedded_reply && {
+-        let promise = v8::Local::new(tc, &entry.promise);
++        let promise = v8::Local::new(tc, entry.promise.as_ref().expect("JS answer has a promise"));
+         matches!(promise.state(), v8::PromiseState::Fulfilled)
+     };
+     let facet_flush_gate = if needs_facet_flush_gate {
+@@ -5913,8 +5944,9 @@ fn begin<'s>(
          Ok((promise, active_request_id)) => {
              tc.perform_microtask_checkpoint();
              let entry = InFlight {
@@ -353,7 +346,7 @@ index 88c5c10..d8efcb9 100644
                  context,
                  scope: None,
                  writes_before: None,
-@@ -3474,8 +3506,9 @@ fn begin_entrypoint_rpc(
+@@ -5982,8 +6014,9 @@ fn begin_entrypoint_rpc(
          Ok(promise) => {
              tc.perform_microtask_checkpoint();
              let entry = InFlight {
@@ -365,7 +358,7 @@ index 88c5c10..d8efcb9 100644
                  context,
                  scope: None,
                  writes_before: None,
-@@ -3704,8 +3737,9 @@ fn begin_queue(
+@@ -6214,8 +6247,9 @@ fn begin_queue(
          Ok(promise) => {
              tc.perform_microtask_checkpoint();
              let entry = InFlight {
@@ -377,7 +370,7 @@ index 88c5c10..d8efcb9 100644
                  context,
                  scope: None,
                  writes_before: None,
-@@ -3854,8 +3888,9 @@ fn start_cell_event<'s>(
+@@ -6513,8 +6547,9 @@ fn start_cell_event<'s>(
          Ok(promise) => {
              tc.perform_microtask_checkpoint();
              let entry = InFlight {
@@ -389,7 +382,7 @@ index 88c5c10..d8efcb9 100644
                  context,
                  scope: Some(scope.to_string()),
                  writes_before,
-@@ -3895,8 +3930,9 @@ fn start_cell_event<'s>(
+@@ -6559,8 +6594,9 @@ fn start_cell_event<'s>(
                  let promise = resolved_promise(tc, undefined)
                      .expect("a finishing cell event can create a resolved promise");
                  Begun::Running(Box::new(InFlight {
@@ -401,7 +394,7 @@ index 88c5c10..d8efcb9 100644
                      context,
                      scope: Some(scope.to_string()),
                      writes_before,
-@@ -4278,7 +4314,13 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight) {
+@@ -6973,7 +7009,13 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
  /// `waitUntil` work once that settles too.
  fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
      if entry.reply.is_some() {
@@ -416,7 +409,7 @@ index 88c5c10..d8efcb9 100644
          match promise.state() {
              v8::PromiseState::Pending => {}
              v8::PromiseState::Fulfilled => {
-@@ -4384,7 +4426,7 @@ enum Started<'s> {
+@@ -7079,7 +7121,7 @@ enum Started<'s> {
      Threw,
  }
  
@@ -425,7 +418,7 @@ index 88c5c10..d8efcb9 100644
      /// Compile the worker module, wire the DO harness, and extract the entry
      /// `fetch`. `do_classes` come from the manifest; `bindings` maps a binding
      /// name to a DO class name (from wrangler metadata).
-@@ -4392,11 +4434,11 @@ impl Worker {
+@@ -7087,11 +7129,11 @@ impl Worker {
      /// The runtime builds a `WorkerConfig` directly. This cfg-gated helper
      /// constructs the same value from individual options.
      #[cfg(celld_internal_tests)]
@@ -439,7 +432,7 @@ index 88c5c10..d8efcb9 100644
          let src = config.src.as_str();
          let script_name = config.script_name.as_str();
          let do_classes = config.do_classes.as_slice();
-@@ -4630,7 +4672,7 @@ impl Worker {
+@@ -7332,7 +7374,7 @@ impl Worker {
              }
              (v8::Global::new(scope, context), v8::Global::new(scope, f))
          };
@@ -448,138 +441,7 @@ index 88c5c10..d8efcb9 100644
              inner: Some(WorkerIsolate {
                  // Every setup scope above has closed, so nothing is entered
                  // on top of this isolate and it can be handed over.
-@@ -6294,7 +6336,7 @@ fn op_fetch(
-         }
-     };
-     let raw_headers = args.get(3).to_rust_string_lossy(scope);
--    let mut headers: Vec<(String, String)> = match serde_json::from_str(&raw_headers) {
-+    let headers: Vec<(String, String)> = match serde_json::from_str(&raw_headers) {
-         Ok(headers) => headers,
-         // Same failure as the body: dropping the headers silently sent an
-         // unauthenticated, unrouted request in place of the real one.
-@@ -6306,21 +6348,63 @@ fn op_fetch(
-         }
-     };
-     let redirect = args.get(4).to_rust_string_lossy(scope);
--    let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
-+    let body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
-         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
-             Some(guard) => guard,
-             None => return loader_throw(scope, "fetch: the body stream is not owned"),
-         },
-         None => RequestBodyGuard(None),
-     };
--    let client = if redirect == "manual" {
-+    let future = outbound_fetch(
-+        method,
-+        url,
-+        body,
-+        headers,
-+        redirect == "manual",
-+        body_guard,
-+        current_trace_ids(scope),
-+    );
-+    let id = asyncrt::enqueue(async move {
-+        let resp = future.await?;
-+        let status = resp.status().as_u16();
-+        let headers = resp
-+            .headers()
-+            .iter()
-+            .map(|(k, v)| {
-+                (
-+                    k.as_str().to_owned(),
-+                    v.to_str().unwrap_or_default().to_owned(),
-+                )
-+            })
-+            .collect::<Vec<_>>();
-+        let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-+        register_http_stream(stream_id, HttpStreamSource::Response(resp));
-+        Ok(
-+            serde_json::json!({"status": status, "streamId": stream_id, "headers": headers})
-+                .to_string(),
-+        )
-+    });
-+    rv.set(promise_for(scope, id));
-+}
-+
-+/// Shared native HTTP operation. Call while the event context and storage are
-+/// installed: durability is sampled here, before the future can leave the turn.
-+fn outbound_fetch(
-+    method: String,
-+    url: String,
-+    body: Option<RequestBody>,
-+    mut headers: Vec<(String, String)>,
-+    manual_redirect: bool,
-+    mut body_guard: RequestBodyGuard,
-+    trace: Option<crate::telemetry::TraceIds>,
-+) -> impl std::future::Future<Output = Result<reqwest::Response, String>> + Send {
-+    let client = if manual_redirect {
-         HTTP_MANUAL.with(|client| client.clone())
-     } else {
-         HTTP.with(|client| client.clone())
-     };
--    // The creating context, read here while JS is still running: the op
--    // future resolves on whatever worker polls it, far from any CPED.
--    let trace = current_trace_ids(scope);
-+    // The caller captures trace and durability while its turn is installed;
-+    // the future can subsequently be polled by any runtime thread.
-     // The child's ids are minted before the request leaves so the
-     // traceparent header carries them: whatever this fetch reaches can
-     // join the trace celld is part of.
-@@ -6339,7 +6423,7 @@ fn op_fetch(
-     // un-act. That covers a write this handler made and a value it only read,
-     // because the third party cannot tell the two apart.
-     let gate = egress_gate_request(celld_logic::Channel::Fetch);
--    let id = asyncrt::enqueue(async move {
-+    async move {
-         let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
-         let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
-             let mut span =
-@@ -6362,7 +6446,8 @@ fn op_fetch(
-         await_egress_gate(gate).await.inspect_err(|error| {
-             finish(false, None, Some(error.clone()));
-         })?;
--        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-+        let m = reqwest::Method::from_bytes(method.as_bytes())
-+            .map_err(|error| format!("invalid HTTP method: {error}"))?;
-         // a timeout bounds a black-hole host: the future settles (Err) instead
-         // of parking run_loop forever — the hang the Drop guard can't catch.
-         let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-@@ -6406,31 +6491,14 @@ fn op_fetch(
-             Ok(resp) => {
-                 let status = resp.status().as_u16();
-                 finish(true, Some(status), None);
--                let headers = resp
--                    .headers()
--                    .iter()
--                    .map(|(name, value)| {
--                        (
--                            name.as_str().to_string(),
--                            value.to_str().unwrap_or_default().to_string(),
--                        )
--                    })
--                    .collect::<Vec<_>>();
--                let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
--                register_http_stream(stream_id, HttpStreamSource::Response(resp));
--                Ok(serde_json::json!({
--                    "status": status, "streamId": stream_id, "headers": headers,
--                })
--                .to_string())
-+                Ok(resp)
-             }
-             Err(e) => {
-                 finish(false, None, Some(format!("fetch: {e}")));
-                 Err(format!("fetch: {e}"))
-             }
-         }
--    });
--    let p = promise_for(scope, id);
--    rv.set(p);
-+    }
- }
- 
- fn op_asset_fetch(
-@@ -7672,6 +7740,11 @@ fn op_test_queue_rearm_bounded(
+@@ -11137,6 +11179,11 @@ fn op_test_queue_rearm_bounded(
          QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
      }
  }
@@ -592,10 +454,10 @@ index 88c5c10..d8efcb9 100644
  mod storage_ops;
  use storage_ops::{actor_runtime_state, throw_storage_error};
 diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
-index e2c290a..116b450 100644
+index 6c63ffa..eebc44d 100644
 --- a/crates/celld/lib.rs
 +++ b/crates/celld/lib.rs
-@@ -329,6 +329,8 @@ pub mod deploy;
+@@ -333,6 +333,8 @@ pub mod deploy;
  pub mod dev;
  pub mod drain_token;
  pub mod env_vars;
@@ -605,10 +467,10 @@ index e2c290a..116b450 100644
  #[cfg(celld_internal_tests)]
  #[allow(clippy::disallowed_methods)]
 diff --git a/crates/celld/main.rs b/crates/celld/main.rs
-index 4eef31a..427df8f 100644
+index d09ef61..feb5296 100644
 --- a/crates/celld/main.rs
 +++ b/crates/celld/main.rs
-@@ -3056,6 +3056,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+@@ -3574,6 +3574,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
      let mut settings = match action {
          Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
          Action::Dev(arguments) => return celld::dev::run(arguments).await,
@@ -628,7 +490,7 @@ index 4eef31a..427df8f 100644
          Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
          Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
 diff --git a/crates/celld/main/cli.rs b/crates/celld/main/cli.rs
-index e99903f..09a4404 100644
+index d3afa8e..80a6c21 100644
 --- a/crates/celld/main/cli.rs
 +++ b/crates/celld/main/cli.rs
 @@ -41,6 +41,7 @@ pub(crate) enum Action {
@@ -647,7 +509,7 @@ index e99903f..09a4404 100644
              "cell" => return Ok(Action::Cell(arguments)),
              "d1" => return Ok(Action::D1(arguments)),
              "kv" => return Ok(Action::Kv(arguments)),
-@@ -273,6 +275,7 @@ USAGE:
+@@ -271,6 +273,7 @@ USAGE:
    celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
    celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
    celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
@@ -702,15 +564,15 @@ index 0000000..f0c30e4
 +}
 diff --git a/crates/celld/native_host.rs b/crates/celld/native_host.rs
 new file mode 100644
-index 0000000..8d0169a
+index 0000000..c3ade96
 --- /dev/null
 +++ b/crates/celld/native_host.rs
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,187 @@
 +//! Scoped native capabilities. Only the worker driver can choose the cell;
 +//! dropping a turn rolls back its unfinished transactions.
 +use crate::storage;
 +use celld_runtime::{HostCall, HostReply};
-+use serde_json::{json, Value};
++use serde_json::{Value, json};
 +
 +pub(crate) struct Host {
 +    pub scope: Option<String>,
@@ -744,7 +606,7 @@ index 0000000..8d0169a
 +                            .as_millis() as i64,
 +                    )),
 +                    None,
-+                ))
++                ));
 +            }
 +            Uuid => return Ok((HostReply::Value(json!(new_uuid()?)), None)),
 +            Log(message) => {
@@ -798,14 +660,15 @@ index 0000000..8d0169a
 +            }
 +            Sql { query, bindings } => {
 +                let (columns, rows, _) = storage::sql_exec(scope, &query, &bindings)?;
-+                json!(rows
-+                    .into_iter()
-+                    .map(|row| columns
-+                        .iter()
-+                        .cloned()
-+                        .zip(row)
-+                        .collect::<serde_json::Map<_, _>>())
-+                    .collect::<Vec<_>>())
++                json!(
++                    rows.into_iter()
++                        .map(|row| columns
++                            .iter()
++                            .cloned()
++                            .zip(row)
++                            .collect::<serde_json::Map<_, _>>())
++                        .collect::<Vec<_>>()
++                )
 +            }
 +            GetAlarm => return Ok((HostReply::Timestamp(storage::get_alarm(scope)), None)),
 +            SetAlarm(at) => {
@@ -894,19 +757,23 @@ index 0000000..8d0169a
 +}
 diff --git a/crates/celld/native_worker.rs b/crates/celld/native_worker.rs
 new file mode 100644
-index 0000000..a082d7d
+index 0000000..645d5dc
 --- /dev/null
 +++ b/crates/celld/native_worker.rs
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,851 @@
 +//! Native worker host. No V8 isolate, JavaScript bootstrap, promise,
 +//! or value conversion is involved in a native invocation. The shared driver
 +//! owns asynchronous futures; this backend only runs bounded interpreter turns.
 +use super::*;
 +use crate::native_host::Host;
 +use celld_runtime::{self as api, Failure, HostCall, HostReply, Step};
-+use serde_json::{json, Value};
++use serde_json::{Value, json};
 +
 +const BODY_LIMIT: usize = 1024 * 1024;
++
++#[cfg(test)]
++#[path = "../../../../tests/native_durability.rs"]
++mod tests;
 +
 +pub struct Worker {
 +    config: Arc<WorkerConfig>,
@@ -929,7 +796,7 @@ index 0000000..a082d7d
 +                .unwrap()
 +                .entry(scope.to_owned())
 +                .or_default()
-+                .acquire(event),
++                .take(event, None, &mut None),
 +            "native turn delivered behind a closed gate"
 +        );
 +        Self {
@@ -940,12 +807,7 @@ index 0000000..a082d7d
 +}
 +impl Drop for InputGuard {
 +    fn drop(&mut self) {
-+        let mut gates = cell_gates().lock().unwrap();
-+        if let Some(gate) = gates.get_mut(&self.scope) {
-+            gate.release(self.event);
-+        }
-+        // Release and wake under the same lock used by cell_gate_wait.
-+        wake_gate_waiters(&self.scope, Ok(()));
++        release_cell_gate(&self.scope, self.event, Ok(()));
 +    }
 +}
 +
@@ -1033,6 +895,7 @@ index 0000000..a082d7d
 +                    scope,
 +                    authority.path,
 +                    authority.epoch,
++                    authority.vfs,
 +                    self.config.compat.sqlite_vec,
 +                )?;
 +                if let Some(name) = storage::get_actor_name(scope)? {
@@ -1074,17 +937,17 @@ index 0000000..a082d7d
 +        reply: Answer,
 +        scope: Option<String>,
 +        request_id: Option<RequestId>,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> InFlight {
 +        let context = IoContext::new();
 +        let writes_before = scope.as_deref().and_then(storage::write_position);
 +        context.begin_event();
 +        if let Some(scope) = &scope {
-+            context
-+                .egress
-+                .lock()
-+                .unwrap()
-+                .push((scope.clone(), writes_before.unwrap_or(0)));
++            context.egress.lock().unwrap().push(EgressFrame {
++                storage: scope.clone(),
++                before: writes_before.unwrap_or(0),
++                root: None,
++            });
 +        }
 +        let gate = scope.as_deref().map(InputGuard::acquire);
 +        InFlight {
@@ -1098,6 +961,7 @@ index 0000000..a082d7d
 +            gated_reply: None,
 +            background: None,
 +            ops: Default::default(),
++            io_context_ops: Default::default(),
 +            alarm: None,
 +            started: Instant::now(),
 +            trace,
@@ -1116,7 +980,7 @@ index 0000000..a082d7d
 +    pub fn turn_begin(
 +        &mut self,
 +        job: crate::WorkerJob,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> (Option<InFlight>, Vec<Op>) {
 +        let _cells = self.cells.install();
 +        let (url, method, body, headers, request_id, reply) = match job {
@@ -1155,7 +1019,7 @@ index 0000000..a082d7d
 +        request_id: Option<RequestId>,
 +        reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
 +        scope: Option<String>,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> (Option<InFlight>, Vec<Op>) {
 +        if Arc::strong_count(&self.live) > 256 {
 +            let _ = reply.send(Ok(response(
@@ -1167,14 +1031,14 @@ index 0000000..a082d7d
 +                    },
 +                    false,
 +                ),
-+                None,
++                (None, None),
 +            )));
 +            return (None, vec![]);
 +        }
 +        let mut entry = self.entry(Answer::Fetch(reply), scope, request_id, trace);
 +        let _context = CurrentGuard::enter(entry.context.clone());
 +        if take_request_cancellation(request_id) {
-+            entry.fail(anyhow!("The client has disconnected"));
++            entry.fail_cancelled(anyhow!("The client has disconnected"));
 +            return (Some(entry), vec![]);
 +        }
 +        let input = Incoming {
@@ -1244,7 +1108,7 @@ index 0000000..a082d7d
 +    pub fn turn_begin_cell(
 +        &mut self,
 +        job: CellJob,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> (Option<InFlight>, Vec<Op>) {
 +        let _cells = self.cells.install();
 +        if Arc::strong_count(&self.live) > 256 {
@@ -1285,6 +1149,7 @@ index 0000000..a082d7d
 +                scheduled_ms,
 +                claim: _,
 +                reply,
++                request_id,
 +            } => {
 +                let now = unix_now_ms();
 +                if now < scheduled_ms {
@@ -1299,7 +1164,7 @@ index 0000000..a082d7d
 +                (
 +                    scope,
 +                    Answer::Alarm(reply),
-+                    Some(AlarmClaim { now_ms: now }),
++                    Some((AlarmClaim { now_ms: now }, request_id)),
 +                )
 +            }
 +            job => {
@@ -1309,8 +1174,13 @@ index 0000000..a082d7d
 +                return (None, vec![]);
 +            }
 +        };
-+        let mut entry = self.entry(answer, Some(scope.clone()), None, trace);
-+        entry.alarm = alarm;
++        let mut entry = self.entry(
++            answer,
++            Some(scope.clone()),
++            alarm.as_ref().and_then(|(_, id)| *id),
++            trace,
++        );
++        entry.alarm = alarm.map(|(claim, _)| claim);
 +        let _context = CurrentGuard::enter(entry.context.clone());
 +        let result = (|| {
 +            let (session, event) = self.program.start(api::Invocation {
@@ -1422,10 +1292,26 @@ index 0000000..a082d7d
 +    fn suspend(&self, entry: &mut InFlight, call: HostCall) -> Result<(), String> {
 +        match call {
 +            HostCall::Sync => {
-+                if entry.scope.is_none() {
-+                    return Err("storage requires a durable object".into());
++                let scope = entry
++                    .scope
++                    .as_deref()
++                    .ok_or("storage requires a durable object")?;
++                if GATE_TX.get().is_none() {
++                    return Err("storage.sync: this process has no output-gate channel".into());
 +                }
-+                let gate = egress_gate_request(celld_logic::Channel::Response);
++                let sample =
++                    storage::sync_sample(scope).ok_or("storage.sync: cell is not resident")?;
++                if sample.in_transaction {
++                    return Err("storage.sync: transaction must commit before syncing".into());
++                }
++                // Sync always proves committed state, including writes from
++                // earlier events. A read-only response ticket cannot do that.
++                let gate = EgressGate::Wrote(
++                    scope.to_owned(),
++                    celld_logic::Channel::Sync,
++                    sample.position,
++                    Some(sample.epoch),
++                );
 +                asyncrt::enqueue(async move {
 +                    await_egress_gate(gate).await?;
 +                    Ok(asyncrt::OpOut::Native(HostReply::Value(Value::Null)))
@@ -1455,14 +1341,14 @@ index 0000000..a082d7d
 +                if body.len() > BODY_LIMIT {
 +                    return Err("fetch body exceeds 1 MiB".into());
 +                }
-+                let body = Some(RequestBody::Bytes(body.into()));
-+                let future = outbound_fetch(
-+                    method,
-+                    url,
-+                    body,
-+                    headers,
-+                    false,
-+                    RequestBodyGuard(None),
++                let future = native_fetch(
++                    api::Request {
++                        url,
++                        method,
++                        headers,
++                        body,
++                    },
++                    entry.context.clone(),
 +                    entry.trace,
 +                );
 +                asyncrt::enqueue(async move {
@@ -1507,7 +1393,7 @@ index 0000000..a082d7d
 +                if entry.scope.as_deref() == Some(&scope) {
 +                    return Err("call same-object methods through self".into());
 +                }
-+                let gate = egress_gate_request(celld_logic::Channel::CellRpc);
++                let gate = egress_gate_request(&entry.context, celld_logic::Channel::CellRpc);
 +                let order = Some(enter_call_order(entry.context.clone(), &scope));
 +                let request_id = next_do_request_id();
 +                let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
@@ -1574,13 +1460,13 @@ index 0000000..a082d7d
 +        entry.gated_reply = match answer {
 +            Answer::Fetch(reply) => {
 +                let result = match result {
-+                    Ok(Step::Return(r)) => Ok(response(r, entry.write_delta())),
++                    Ok(Step::Return(r)) => Ok(response(r, entry.gate_positions())),
 +                    Ok(Step::Call(_)) => Err(anyhow!(
 +                        "native execution completed with a pending host call"
 +                    )),
 +                    Err(error) => Ok(response(
 +                        self.program.error_response(error, entry.scope.is_some()),
-+                        entry.write_delta(),
++                        entry.gate_positions(),
 +                    )),
 +                };
 +                send_answer_after_arm_gates(reply, result, gates)
@@ -1594,7 +1480,9 @@ index 0000000..a082d7d
 +                            entry.write_delta(),
 +                        )
 +                    })
-+                    .map_err(anyhow::Error::from);
++                    .map_err(|error| {
++                        fail_in_turn_error(anyhow::Error::from(error), entry.gate_positions())
++                    });
 +                send_answer_after_arm_gates(reply, result, gates)
 +            }
 +            answer => answer.fail_with_arm_gates(anyhow!("invalid native answer"), gates),
@@ -1602,16 +1490,18 @@ index 0000000..a082d7d
 +    }
 +    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
 +        let _cells = self.cells.install();
-+        entry.fail(anyhow!("The client has disconnected"));
++        entry.fail_cancelled(anyhow!("The client has disconnected"));
 +        entry.context.end_event();
++        entry.abandon();
 +        vec![]
 +    }
 +    pub fn turn_poll(&mut self, _entry: &mut InFlight) -> Vec<Op> {
 +        vec![]
 +    }
-+    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) {
++    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) -> Option<u64> {
 +        let _cells = self.cells.install();
 +        entry.settle_alarm(false, false);
++        entry.write_delta()
 +    }
 +}
 +
@@ -1625,7 +1515,10 @@ index 0000000..a082d7d
 +        message: "body exceeds 1 MiB".into(),
 +    }
 +}
-+fn response(r: api::Response, write_position: Option<u64>) -> HttpResponse {
++fn response(
++    r: api::Response,
++    (write_position, observed_position): (Option<u64>, Option<u64>),
++) -> HttpResponse {
 +    HttpResponse {
 +        status: r.status,
 +        headers: r.headers,
@@ -1633,6 +1526,79 @@ index 0000000..a082d7d
 +        stream: None,
 +        websocket: None,
 +        write_position,
++        observed_position,
++    }
++}
++
++/// Buffered native HTTP uses celld's pooled Rust client. Capture the event's
++/// durability ticket before yielding; the driver cancels this future on hangup.
++fn native_fetch(
++    request: api::Request,
++    context: Arc<IoContext>,
++    trace: Option<crate::telemetry::TraceContext>,
++) -> impl std::future::Future<Output = Result<reqwest::Response, String>> + Send {
++    let client = HTTP.with(Clone::clone);
++    let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
++    let api::Request {
++        url,
++        method,
++        mut headers,
++        body,
++    } = request;
++    let child = trace.as_ref().map(crate::telemetry::child_context);
++    if let Some(child) = child.as_ref() {
++        if !headers
++            .iter()
++            .any(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
++        {
++            headers.push(("traceparent".into(), crate::telemetry::traceparent(child)));
++        }
++    }
++    let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
++    let child_recording = child.and_then(crate::telemetry::TraceContext::recording_ids);
++    async move {
++        let started = recording.map(|_| crate::telemetry::now_unix_us());
++        let span = recording.zip(child_recording).map(|(parent, child)| {
++            let mut span =
++                crate::telemetry::Span::new(child, "fetch", crate::telemetry::KIND_CLIENT);
++            span.parent_span_id = Some(parent.span_id);
++            span.parent_remote = Some(false);
++            span.url = Some(url.clone());
++            span
++        });
++        let result = async {
++            await_egress_gate(gate).await?;
++            let method = reqwest::Method::from_bytes(method.as_bytes())
++                .map_err(|_| "invalid HTTP method".to_string())?;
++            let timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
++                .expect("validated CELLD_FETCH_TIMEOUT_S");
++            let empty_body_needs_length = body.is_empty()
++                && !headers.iter().any(|(name, _)| {
++                    name.eq_ignore_ascii_case("content-length")
++                        || name.eq_ignore_ascii_case("transfer-encoding")
++                });
++            let mut request = client
++                .request(method, url)
++                .timeout(Duration::from_secs(timeout))
++                .body(body);
++            for (name, value) in headers {
++                request = request.header(name, value);
++            }
++            if empty_body_needs_length {
++                request = request.header(reqwest::header::CONTENT_LENGTH, 0);
++            }
++            request.send().await.map_err(|e| format!("fetch: {e}"))
++        }
++        .await;
++        if let Some(mut span) = span {
++            span.start_unix_us = started.unwrap_or_default();
++            span.duration_us = crate::telemetry::now_unix_us() - span.start_unix_us;
++            span.ok = result.is_ok();
++            span.http_status = result.as_ref().ok().map(|r| r.status().as_u16());
++            span.error = result.as_ref().err().cloned();
++            crate::telemetry::record(span);
++        }
++        result
 +    }
 +}
 +async fn collect(mut stream: HttpChunkStream) -> Result<Vec<u8>, String> {
@@ -1647,7 +1613,7 @@ index 0000000..a082d7d
 +    Ok(body)
 +}
 diff --git a/crates/celld/protocol.rs b/crates/celld/protocol.rs
-index 9a65853..34b2718 100644
+index 1462c3d..cd91c00 100644
 --- a/crates/celld/protocol.rs
 +++ b/crates/celld/protocol.rs
 @@ -291,9 +291,16 @@ fn valid_binding_name(name: &str) -> bool {
@@ -1668,44 +1634,74 @@ index 9a65853..34b2718 100644
              anyhow::bail!(
                  "deployment requires feature {feature:?} this celld build does not support; upgrade celld"
              );
-@@ -308,7 +315,7 @@ pub struct ModuleRef {
-     pub bytes: usize,
-     /// content hash of this module's bytes (hex, truncated)
+@@ -311,7 +318,7 @@ pub struct ModuleRef {
+     /// The loader also accepts the 16-character prefix written by celld and
+     /// the managed control plane before full module digests were introduced.
      pub sha256: String,
 -    /// Absent means UTF-8 source: the main module is ESM, siblings become
 +    /// Absent means UTF-8 source: the main module selects its runtime, siblings become
      /// text modules. `wasm` bytes become a module whose default export is a
      /// compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
      #[serde(default, skip_serializing_if = "Option::is_none")]
+diff --git a/crates/celld/runtime.rs b/crates/celld/runtime.rs
+index 055a20d..847df59 100644
+--- a/crates/celld/runtime.rs
++++ b/crates/celld/runtime.rs
+@@ -3922,7 +3922,7 @@ async fn drive_cell_inner(
+             }
+             Wake::Expired => {
+                 entry.time_out(budget);
+-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
++                slot.turn(|worker| worker.turn_retire_input_gates(&mut entry))
+                     .await;
+                 #[cfg(celld_internal_tests)]
+                 notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+@@ -3930,7 +3930,7 @@ async fn drive_cell_inner(
+             }
+             Wake::Idle => {
+                 entry.stuck();
+-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
++                slot.turn(|worker| worker.turn_retire_input_gates(&mut entry))
+                     .await;
+                 #[cfg(celld_internal_tests)]
+                 notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+@@ -3999,7 +3999,7 @@ async fn drive_cell_inner(
+         span.parent_remote = parent.map(|_| false);
+         crate::telemetry::record(span);
+     }
+-    slot.turn(|worker| worker.turn_abandon_input_gates(&entry))
++    slot.turn(|worker| worker.turn_abandon_input_gates(&mut entry))
+         .await;
+     entry.abandon();
+     alarm_write
 diff --git a/crates/celld/storage.rs b/crates/celld/storage.rs
-index c8cf8f5..673344c 100644
+index 043e457..35fcacb 100644
 --- a/crates/celld/storage.rs
 +++ b/crates/celld/storage.rs
-@@ -2891,6 +2891,18 @@ pub fn put(scope: &str, key: &str, val: &str) {
-     });
+@@ -3374,6 +3374,17 @@ fn with_application_storage_write<T>(
+     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
  }
  
-+/// Store a native JSON value as TEXT, readable by every runtime's JSON path.
++/// Store a native JSON value through the same failure tracking as V8 writes.
 +pub fn put_json(scope: &str, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
 +    let encoded = serde_json::to_string(value)?;
-+    with(scope, |c| {
++    with_application_storage_write(scope, |c| {
 +        c.prepare_cached(KV_PUT_SQL)?
 +            .execute(rusqlite::params![scope, key, encoded])
 +            .map(|_| ())
 +            .map_err(Into::into)
 +    })
-+    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 +}
 +
  pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
-     with(scope, |c| {
+     with_application_storage_write(scope, |c| {
          c.prepare_cached(KV_PUT_SQL)?
 diff --git a/crates/celld/worker.rs b/crates/celld/worker.rs
 new file mode 100644
-index 0000000..237057e
+index 0000000..b1936fb
 --- /dev/null
 +++ b/crates/celld/worker.rs
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,107 @@
 +//! Runtime selection at materialization. Both engines use the same pool,
 +//! request driver, admission, storage ownership, and durability gates.
 +use super::*;
@@ -1739,14 +1735,14 @@ index 0000000..237057e
 +    pub fn turn_begin(
 +        &mut self,
 +        job: crate::WorkerJob,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> (Option<InFlight>, Vec<Op>) {
 +        dispatch!(self, turn_begin, job, trace)
 +    }
 +    pub fn turn_begin_cell(
 +        &mut self,
 +        job: CellJob,
-+        trace: Option<crate::telemetry::TraceIds>,
++        trace: Option<crate::telemetry::TraceContext>,
 +    ) -> (Option<InFlight>, Vec<Op>) {
 +        dispatch!(self, turn_begin_cell, job, trace)
 +    }
@@ -1761,10 +1757,27 @@ index 0000000..237057e
 +    pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
 +        dispatch!(self, turn_cancel, entry)
 +    }
++    pub fn turn_cancel_for_shutdown(&mut self, entry: &mut InFlight) -> Vec<Op> {
++        match self {
++            Self::JavaScript(worker) => worker.turn_cancel_for_shutdown(entry),
++            Self::Native(worker) => worker.turn_cancel(entry),
++        }
++    }
++    pub(crate) fn turn_retire_input_gates(&mut self, entry: &mut InFlight) {
++        // Native input gates are owned by the invocation's Drop guard.
++        if let Self::JavaScript(worker) = self {
++            worker.turn_retire_input_gates(entry);
++        }
++    }
++    pub(crate) fn turn_abandon_input_gates(&mut self, entry: &mut InFlight) {
++        if let Self::JavaScript(worker) = self {
++            worker.turn_abandon_input_gates(entry);
++        }
++    }
 +    pub fn turn_poll(&mut self, entry: &mut InFlight) -> Vec<Op> {
 +        dispatch!(self, turn_poll, entry)
 +    }
-+    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) {
++    pub fn turn_finish_alarm(&mut self, entry: &mut InFlight) -> Option<u64> {
 +        dispatch!(self, turn_finish_alarm, entry)
 +    }
 +    pub fn own_cell(
@@ -1773,6 +1786,21 @@ index 0000000..237057e
 +        storage: Option<CellStorage<'_>>,
 +    ) -> Result<Option<i64>> {
 +        dispatch!(self, own_cell, cell, storage)
++    }
++    pub(super) fn own_embedded_cell(
++        &mut self,
++        cell: &str,
++        parent: &storage::StorageIdentity,
++        name: &str,
++        id: &str,
++        props_json: &str,
++    ) -> Result<Option<i64>> {
++        match self {
++            Self::JavaScript(worker) => {
++                worker.own_embedded_cell(cell, parent, name, id, props_json)
++            }
++            Self::Native(_) => Err(anyhow!("native runtimes do not support embedded facets")),
++        }
 +    }
 +    pub fn set_id_name(&mut self, scope: &str, name: &str) -> Result<()> {
 +        dispatch!(self, set_id_name, scope, name)

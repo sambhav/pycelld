@@ -1,16 +1,16 @@
 diff --git a/crates/celld/bucket.rs b/crates/celld/bucket.rs
-index 3ee16e7..2e31e01 100644
+index 5745c36..4c54283 100644
 --- a/crates/celld/bucket.rs
 +++ b/crates/celld/bucket.rs
-@@ -23,6 +23,7 @@
- //! In the same spirit a response that carries no CAS token is an error,
- //! never an empty token a later conditional write would trust.
+@@ -25,6 +25,7 @@
+ //! that carries no CAS token is an error, never an empty token a later
+ //! conditional write would trust.
  
 +use crate::s3_etag::S3EtagMode;
  use anyhow::anyhow;
  use anyhow::Context;
  use bytes::Bytes;
-@@ -158,6 +159,7 @@ pub struct Bucket {
+@@ -160,6 +161,7 @@ pub struct Bucket {
      /// ambiguity must surface as `Err` so the caller reconciles.
      pub cas_store: Arc<dyn ObjectStore>,
      pub backend: StorageBackend,
@@ -18,7 +18,7 @@ index 3ee16e7..2e31e01 100644
      /// Bucket name, for messages — the store is already bound to it.
      pub name: String,
      /// Empty, or a slash-terminated key prefix every operation is scoped
-@@ -470,6 +472,7 @@ impl Bucket {
+@@ -545,6 +547,7 @@ impl Bucket {
              paginated: Arc::new(UnpaginatedStore),
              cas_store,
              backend,
@@ -26,7 +26,7 @@ index 3ee16e7..2e31e01 100644
              name,
              prefix,
          }
-@@ -523,6 +526,7 @@ impl Bucket {
+@@ -598,6 +601,7 @@ impl Bucket {
              paginated: store.clone(),
              cas_store: store,
              backend: StorageBackend::Local,
@@ -34,7 +34,7 @@ index 3ee16e7..2e31e01 100644
              name: database.display().to_string(),
              prefix: String::new(),
          })
-@@ -546,6 +550,7 @@ impl Bucket {
+@@ -621,6 +625,7 @@ impl Bucket {
              azure: azure_env,
          } = sources;
          let (backend, bucket, prefix) = split_spec(bucket);
@@ -42,7 +42,7 @@ index 3ee16e7..2e31e01 100644
          // The prefix is spliced into keys as plain text and stripped off
          // listed keys the same way. A character `object_store` would
          // percent-encode would make the two disagree, so refuse it here
-@@ -694,6 +699,7 @@ impl Bucket {
+@@ -780,6 +785,7 @@ impl Bucket {
              paginated,
              cas_store,
              backend,
@@ -50,7 +50,7 @@ index 3ee16e7..2e31e01 100644
              name: bucket.to_string(),
              prefix,
          })
-@@ -712,6 +718,25 @@ impl Bucket {
+@@ -798,6 +804,25 @@ impl Bucket {
          self.backend
      }
  
@@ -76,7 +76,7 @@ index 3ee16e7..2e31e01 100644
      /// Scope a caller's key to this client's prefix.
      fn key(&self, key: &str) -> String {
          format!("{}{key}", self.prefix)
-@@ -729,7 +754,6 @@ impl Bucket {
+@@ -815,7 +840,6 @@ impl Bucket {
          match self.store.get(&Path::from(key.as_str())).await {
              Ok(result) => {
                  let token = self
@@ -84,7 +84,7 @@ index 3ee16e7..2e31e01 100644
                      .token(result.meta.e_tag.clone(), result.meta.version.clone())
                      .with_context(|| format!("read {}://{}/{key}", self.scheme(), self.name))?;
                  let bytes = result.bytes().await.with_context(|| {
-@@ -750,7 +774,6 @@ impl Bucket {
+@@ -836,7 +860,6 @@ impl Bucket {
          match self.store.head(&Path::from(key.as_str())).await {
              Ok(meta) => {
                  let token = self
@@ -92,7 +92,7 @@ index 3ee16e7..2e31e01 100644
                      .token(meta.e_tag, meta.version)
                      .with_context(|| format!("head {}://{}/{key}", self.scheme(), self.name))?;
                  Ok(Some((meta.size, token)))
-@@ -844,7 +867,7 @@ impl Bucket {
+@@ -930,7 +953,7 @@ impl Bucket {
          let key = self.key(key);
          let mode = match token {
              None => PutMode::Create,
@@ -101,7 +101,7 @@ index 3ee16e7..2e31e01 100644
          };
          match self
              .cas_store
-@@ -859,16 +882,13 @@ impl Bucket {
+@@ -945,16 +968,13 @@ impl Bucket {
                  // The write applied; a result without a usable token still
                  // surfaces as `Err`, which callers already treat as "may
                  // have committed" and reconcile.
@@ -125,7 +125,7 @@ index 3ee16e7..2e31e01 100644
                  Ok(Some(token))
              }
              Err(error) if is_clean_cas_rejection(&error) => Ok(None),
-@@ -1170,7 +1190,7 @@ impl Bucket {
+@@ -1295,7 +1315,7 @@ impl Bucket {
                              self.name
                          ));
                      };
@@ -134,7 +134,7 @@ index 3ee16e7..2e31e01 100644
                  }
                  // Nothing there: only a condition that an absent object can
                  // satisfy may write, and it writes as a create so that a
-@@ -1199,7 +1219,6 @@ impl Bucket {
+@@ -1324,7 +1344,6 @@ impl Bucket {
              Ok(result) => Ok(Some(BlobMeta {
                  size,
                  cas: self
@@ -142,7 +142,7 @@ index 3ee16e7..2e31e01 100644
                      .token(result.e_tag.clone(), result.version.clone())
                      .ok(),
                  etag: result.e_tag,
-@@ -1330,10 +1349,7 @@ impl Bucket {
+@@ -1455,10 +1474,7 @@ impl Bucket {
              size: meta.size,
              etag: meta.e_tag.clone(),
              version: meta.version.clone(),
@@ -155,10 +155,10 @@ index 3ee16e7..2e31e01 100644
              attributes: BlobAttributes::read(attributes),
          }
 diff --git a/crates/celld/env_vars.rs b/crates/celld/env_vars.rs
-index 5350c6e..e3fd549 100644
+index a51559e..c4329b6 100644
 --- a/crates/celld/env_vars.rs
 +++ b/crates/celld/env_vars.rs
-@@ -14,6 +14,8 @@ use anyhow::{anyhow, bail};
+@@ -38,6 +38,8 @@ pub struct ShutdownTiming {
  /// they cannot return a configuration error at the point of use. This pass
  /// makes those reads infallible without giving malformed values a default.
  pub fn validate() -> anyhow::Result<()> {
@@ -167,7 +167,7 @@ index 5350c6e..e3fd549 100644
      for name in [
          "CELLD_CLOUD",
          "CELLD_CLOUD_RESTART_ON_DEPLOY",
-@@ -180,3 +182,52 @@ where
+@@ -239,3 +241,52 @@ where
  {
      Ok(positive(name)?.unwrap_or(default))
  }
@@ -221,10 +221,10 @@ index 5350c6e..e3fd549 100644
 +    }
 +}
 diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
-index b7b9a43..e2c290a 100644
+index 98e6513..6c63ffa 100644
 --- a/crates/celld/lib.rs
 +++ b/crates/celld/lib.rs
-@@ -329,6 +329,7 @@ pub mod deploy;
+@@ -333,6 +333,7 @@ pub mod deploy;
  pub mod dev;
  pub mod drain_token;
  pub mod env_vars;
@@ -233,7 +233,7 @@ index b7b9a43..e2c290a 100644
  #[allow(clippy::disallowed_methods)]
  #[doc(hidden)]
 diff --git a/crates/celld/main/cli.rs b/crates/celld/main/cli.rs
-index e79ba3e..e99903f 100644
+index 6f6e6aa..d3afa8e 100644
 --- a/crates/celld/main/cli.rs
 +++ b/crates/celld/main/cli.rs
 @@ -62,11 +62,10 @@ impl Action {
@@ -251,15 +251,15 @@ index e79ba3e..e99903f 100644
      }
  }
  
-@@ -346,6 +345,7 @@ ENVIRONMENT:
+@@ -344,6 +343,7 @@ ENVIRONMENT:
    CELLD_ASSET_CACHE_BYTES         Asset cache limit
  
  TUNING:
 +  CELLD_S3_ETAG_MODE             S3 CAS token spelling: preserve (default), quoted, unquoted
-   CELLD_STORAGE_PROBE             `0` skips the startup conditional-write test
+   CELLD_STORAGE_PROBE             `0` skips the startup storage-contract test
                                    (default: on)
    CELLD_TTL_MS                    Node lease lifetime (default: 10000)
-@@ -366,6 +366,7 @@ TUNING:
+@@ -373,6 +373,7 @@ TUNING:
    CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
    CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
    CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
@@ -268,10 +268,10 @@ index e79ba3e..e99903f 100644
    CELLD_HANDLER_BUDGET_S          JavaScript handler budget
    CELLD_TOKIO_THREADS             Tokio runtime worker threads
 diff --git a/crates/celld/runtime.rs b/crates/celld/runtime.rs
-index f9f5062..f575d1f 100644
+index abba23d..055a20d 100644
 --- a/crates/celld/runtime.rs
 +++ b/crates/celld/runtime.rs
-@@ -297,7 +297,6 @@ pub fn admission_wait() -> std::time::Duration {
+@@ -497,7 +497,6 @@ pub fn admission_wait() -> std::time::Duration {
  pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
      const GROW_AT: usize = 2;
      const SHRINK_UNDER: usize = 1;
@@ -279,7 +279,7 @@ index f9f5062..f575d1f 100644
      let cores = std::thread::available_parallelism()
          .map(|n| n.get())
          .unwrap_or(4);
-@@ -308,9 +307,11 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
+@@ -508,9 +507,11 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
          shrink_under: SHRINK_UNDER,
          max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
          max_requests: env_usize("CELLD_MAX_REQUESTS"),

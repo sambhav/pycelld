@@ -3,6 +3,7 @@ on:
   pull_request:
     paths: ['Cargo.*', '.cargo/**', 'xtask/**', 'patches/**', 'upstream/**', 'tests/**', 'crates/**', 'examples/monty/**', 'tools/monty-checks/**', '.github/workflows/monty.yml']
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 jobs:

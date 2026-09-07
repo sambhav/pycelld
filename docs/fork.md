@@ -1,7 +1,7 @@
 # Host configuration and native binaries
 
 The host-options patch adds optional CPU cell density and S3 ETag spelling settings to celld
-0.4.0. Neither changes the storage protocol or adds an external dependency.
+0.4.1. Neither changes the storage protocol or adds an external dependency.
 
 ## Ceph and S3 ETag compatibility
 

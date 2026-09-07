@@ -21,6 +21,12 @@ env:
   SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  validate:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-binaries')
+    uses: ./.github/workflows/monty.yml
+
   build:
     if: >-
       github.event_name != 'pull_request' ||
@@ -68,7 +74,7 @@ jobs:
             pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
             pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-
       - run: cargo xtask prepare
-      - name: Test configuration and placement
+      - name: Test cell packing and retirement
         run: cargo test --manifest-path tools/packing-checks/Cargo.toml --locked
       - name: Build release binary
         run: cargo xtask build --target "$TARGET" --release
@@ -126,7 +132,7 @@ jobs:
 
   assemble:
     name: Verify complete release assets
-    needs: build
+    needs: [build, validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

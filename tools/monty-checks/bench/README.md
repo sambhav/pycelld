@@ -39,7 +39,8 @@ round trip. Binary buffers stay native throughout the Monty HTTP path.
 
 **72 samples, 306,946 validated responses, zero errors.**
 
-Measured on 2026-09-07 using the external runtime crates and patched upstream build.
+Measured on 2026-09-07 using the external runtime crates and patched celld 0.4.0.
+These measurements predate the 0.4.1 upgrade.
 
 Median requests/second across the three repetitions:
 

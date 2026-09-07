@@ -10,7 +10,8 @@ python3 tools/storage-checks/probe.py target/lab/celld -v
 `cargo xtask test` covers the standalone Monty interpreter and typed runtime
 boundary, a second runtime using the public extension API, native worker
 cancellation and capacity, deployment compilation, host configuration, cell
-placement, and reproducible patch preparation.
+placement, error/cancellation durability positions, sync proof refusal, paged
+SQLite activation, and reproducible patch preparation.
 
 The end-to-end test starts local celld processes and checks real HTTP responses,
 POST routing, dataclasses, buffered bytes, native fetch, durable calls,

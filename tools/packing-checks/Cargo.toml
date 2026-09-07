@@ -11,6 +11,3 @@ publish = false
 [lib]
 path = "lib.rs"
 doctest = false
-
-[dependencies]
-anyhow = "=1.0.104"

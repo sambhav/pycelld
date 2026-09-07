@@ -95,4 +95,4 @@ python3 tools/monty-checks/e2e.py target/lab/celld
 - [Benchmark results](tools/monty-checks/bench/README.md)
 
 Upstream architecture and operational documentation are available in the
-[celld repository](https://github.com/denoland/celld/tree/a52f9905425bc41134d817694bdc2c50bcc5e856/docs).
+[celld repository](https://github.com/denoland/celld/tree/10cb1303dac710dcb3b557e318e08c855261f68b/docs).
