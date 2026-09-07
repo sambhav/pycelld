@@ -8,8 +8,17 @@ use api::{HostCall, HostReply, Response, Step};
 use celld_runtime as api;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 
-pub struct Monty;
+#[derive(Clone, Default)]
+pub struct Monty {
+    pub(crate) extensions: Arc<crate::extensions::Extensions>,
+}
+impl Monty {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
@@ -20,8 +29,12 @@ impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
         &DESCRIPTOR
     }
-    fn types(&self) -> &'static str {
-        crate::TYPES
+    fn types(&self) -> &str {
+        if self.extensions.types.is_empty() {
+            crate::TYPES
+        } else {
+            &self.extensions.types
+        }
     }
     fn compile(&self, source: &str) -> api::Result<Box<dyn api::Program>> {
         if source.len() > 256 * 1024 {
@@ -29,11 +42,12 @@ impl api::Runtime for Monty {
         }
         let classes = durable_classes(source)?;
         Ok(Box::new(Program {
-            http: Module::compile(source)?,
+            http: Module::compile_extended(source, None, self.extensions.clone())?,
             objects: classes
                 .iter()
                 .map(|name| {
-                    Module::compile_class(source, name).map(|module| (name.clone(), module))
+                    Module::compile_extended(source, Some(name), self.extensions.clone())
+                        .map(|module| (name.clone(), module))
                 })
                 .collect::<Result<_, _>>()?,
             classes,

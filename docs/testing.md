@@ -5,6 +5,7 @@ python3 -m unittest discover -s tools -p test_release.py -v
 cargo xtask test
 cargo xtask build
 python3 tools/monty-checks/e2e.py target/lab/celld
+python3 tools/monty-checks/consumer.py
 python3 tools/storage-checks/probe.py target/lab/celld -v
 ```
 
@@ -13,6 +14,18 @@ boundary, a second runtime using the public extension API, native worker
 cancellation and capacity, deployment compilation, host configuration, cell
 placement, error/cancellation durability positions, sync proof refusal, paged
 SQLite activation, and reproducible patch preparation.
+
+Extension regressions cover keyword/default binding, native binary values,
+catchable Rust errors, registration validation, budgets, and helper classes in
+stateless and durable executions. Maintainer commands also verify that every
+included host source matches the pinned upstream plus the patch series.
+
+The consumer check builds a separate application using a Git dependency on the
+current commit, with no patch or preparation step in that application. It checks
+generated declarations with strict mypy (including a negative type test), then
+exercises custom Rust functions and Python classes over HTTP, async context
+calls, dataclass RPC, and durable storage. Use `consumer.py --path` to check
+uncommitted local changes before committing; CI always checks the Git import.
 
 Native pool regressions exercise concurrent cell placement at densities 1, 2,
 and 32, packing after eviction, suspension across retirement, reclaiming drained

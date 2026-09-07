@@ -71,8 +71,8 @@ impl Drop for TestExecution {
 #[tokio::test]
 async fn registration_feature_negotiation_native_io_and_cancellation() {
     assert!(celld::protocol::validate_required_features(&["test-v1".into()]).is_err());
-    register(&TestRuntime).unwrap();
-    assert!(register(&TestRuntime).is_err());
+    register(TestRuntime).unwrap();
+    assert!(register(TestRuntime).is_err());
     celld::protocol::validate_required_features(&["test-v1".into()]).unwrap();
     assert!(celld::protocol::validate_required_features(&["monty-native-v1".into()]).is_err());
     let config = Arc::new(WorkerConfig::new(WorkerConfigOptions {

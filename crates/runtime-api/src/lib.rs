@@ -15,7 +15,7 @@ pub struct Descriptor {
 pub trait Runtime: Send + Sync {
     fn descriptor(&self) -> &Descriptor;
     fn compile(&self, source: &str) -> Result<Box<dyn Program>>;
-    fn types(&self) -> &'static str;
+    fn types(&self) -> &str;
 }
 
 /// Cached compilation is cloned once per worker slot. Programs and executions

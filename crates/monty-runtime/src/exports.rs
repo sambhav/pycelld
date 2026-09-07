@@ -5,6 +5,7 @@ use ruff_python_ast::{Expr, Stmt};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -90,6 +91,7 @@ pub struct Function {
     runner: MontyRun,
     pub(crate) rpc: bool,
     parameters: BTreeMap<String, Parameter>,
+    pub(crate) extensions: Arc<crate::extensions::Extensions>,
 }
 impl Function {
     pub(crate) fn start(
@@ -127,20 +129,26 @@ impl Function {
             max_recursion_depth: 100,
             ..Default::default()
         };
+        let mut inputs = vec![
+            crate::value::from_json(&Value::Object(args.clone())),
+            crate::value::from_json(context),
+            MontyObject::Function {
+                name: "_celld_host".into(),
+                docstring: None,
+            },
+        ];
+        inputs.extend(
+            self.extensions
+                .functions
+                .keys()
+                .map(|name| MontyObject::Function {
+                    name: name.clone(),
+                    docstring: None,
+                }),
+        );
         self.runner
             .clone()
-            .start(
-                vec![
-                    crate::value::from_json(&Value::Object(args.clone())),
-                    crate::value::from_json(context),
-                    MontyObject::Function {
-                        name: "_celld_host".into(),
-                        docstring: None,
-                    },
-                ],
-                ResourceTracker::new(limits),
-                PrintWriter::Disabled,
-            )
+            .start(inputs, ResourceTracker::new(limits), PrintWriter::Disabled)
             .map_err(crate::Failure::python)
     }
 }
@@ -152,49 +160,21 @@ pub struct Module {
 impl Module {
     /// Discovers only direct, public function declarations in the entry module.
     /// A literal __all__ optionally restricts that set; imports/classes/aliases are excluded.
+    #[cfg(test)]
     pub fn compile(source: &str) -> Result<Self, String> {
-        Self::compile_inner(source, None)
+        Self::compile_extended(source, None, Arc::default())
     }
+    #[cfg(test)]
     pub fn compile_class(source: &str, class: &str) -> Result<Self, String> {
-        Self::compile_inner(source, Some(class))
+        Self::compile_extended(source, Some(class), Arc::default())
     }
-    fn compile_inner(source: &str, class: Option<&str>) -> Result<Self, String> {
-        let original = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
-        let mut code = source.as_bytes().to_vec();
-        for statement in &original.syntax().body {
-            if let Stmt::ImportFrom(import) = statement {
-                if import
-                    .module
-                    .as_ref()
-                    .is_some_and(|name| name.as_str() == "celld")
-                    && import.level == 0
-                {
-                    for alias in &import.names {
-                        if !matches!(
-                            alias.name.as_str(),
-                            "Context"
-                                | "Storage"
-                                | "Alarms"
-                                | "Request"
-                                | "Response"
-                                | "Json"
-                                | "SqlValue"
-                        ) || alias.asname.is_some()
-                        {
-                            return Err("use unaliased imports from celld: Context, Storage, Alarms, Request, Response, Json, SqlValue".into());
-                        }
-                    }
-                    for byte in
-                        &mut code[import.range.start().to_usize()..import.range.end().to_usize()]
-                    {
-                        if *byte != b'\n' && *byte != b'\r' {
-                            *byte = b' ';
-                        }
-                    }
-                }
-            }
-        }
-        let source = std::str::from_utf8(&code).map_err(|e| e.to_string())?;
+    pub(crate) fn compile_extended(
+        source: &str,
+        class: Option<&str>,
+        extensions: Arc<crate::extensions::Extensions>,
+    ) -> Result<Self, String> {
+        let code = celld_imports(source, &extensions.names)?;
+        let source = code.as_str();
         let parsed = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
         let mut definitions = BTreeMap::new();
         let mut explicit = None;
@@ -370,8 +350,9 @@ impl Module {
             );
             let construction = class.map_or_else(String::new, |class| format!("_celld_instance = _celld_impl_{class}(id=_celld_context.id, ctx=_celld_context)\n_celld_instance.id = _celld_context.id"));
             let code = format!(
-                "{}\n{source}\n{proxies}\n{context_init}\n{construction}\n{call}",
+                "{}\n{}\n{source}\n{proxies}\n{context_init}\n{construction}\n{call}",
                 include_str!("context.py"),
+                extensions.source,
                 context_init = if context_parameter || construct_with_context {
                     "_celld_context = Context(_celld_metadata)"
                 } else {
@@ -385,7 +366,10 @@ impl Module {
                     "_celld_args".into(),
                     "_celld_metadata".into(),
                     "_celld_host".into(),
-                ],
+                ]
+                .into_iter()
+                .chain(extensions.functions.keys().cloned())
+                .collect(),
                 CompileOptions::default(),
             )
             .map_err(|e| e.to_string())?;
@@ -395,6 +379,7 @@ impl Module {
                     runner,
                     rpc: class.is_some(),
                     parameters,
+                    extensions: extensions.clone(),
                 },
             );
         }
@@ -403,6 +388,38 @@ impl Module {
     pub fn get(&self, name: &str) -> Option<&Function> {
         self.functions.get(name)
     }
+}
+
+pub(crate) fn celld_imports(source: &str, names: &BTreeSet<String>) -> Result<String, String> {
+    let parsed = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
+    let mut code = source.as_bytes().to_vec();
+    for statement in &parsed.syntax().body {
+        if let Stmt::ImportFrom(import) = statement {
+            if import.level == 0
+                && import
+                    .module
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == "celld")
+            {
+                for alias in &import.names {
+                    if alias.asname.is_some()
+                        || !(crate::extensions::BUILTINS.contains(&alias.name.as_str())
+                            || names.contains(alias.name.as_str()))
+                    {
+                        return Err(format!("unknown or aliased celld import: {}", alias.name));
+                    }
+                }
+                for byte in
+                    &mut code[import.range.start().to_usize()..import.range.end().to_usize()]
+                {
+                    if *byte != b'\n' && *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
+            }
+        }
+    }
+    String::from_utf8(code).map_err(|e| e.to_string())
 }
 
 /// A durable class is an ordinary class whose constructor declares `ctx`.

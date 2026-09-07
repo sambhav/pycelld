@@ -1,7 +1,16 @@
-diff --git b/crates/celld/Cargo.toml a/crates/celld/Cargo.toml
-index 38e21b0..83b4279 100644
+diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+index 38e21b0..8ed6af2 100644
 --- a/crates/celld/Cargo.toml
 +++ b/crates/celld/Cargo.toml
+@@ -11,7 +11,7 @@ path = "lib.rs"
+ 
+ [[bin]]
+ name = "celld"
+-path = "main.rs"
++path = "bin.rs"
+ 
+ [lints.rust.unexpected_cfgs]
+ level = "warn"
 @@ -24,7 +24,16 @@ disallowed_macros = "forbid"
  name = "native_extension"
  path = "../../../../tests/native_extension.rs"
@@ -19,20 +28,69 @@ index 38e21b0..83b4279 100644
  celld-runtime = { path = "../../../../crates/runtime-api" }
  async-trait.workspace = true
  chrono.workspace = true
-diff --git b/crates/celld/main.rs a/crates/celld/main.rs
-index feb5296..596676b 100644
+diff --git a/crates/celld/bin.rs b/crates/celld/bin.rs
+new file mode 100644
+index 0000000..1197f4c
+--- /dev/null
++++ b/crates/celld/bin.rs
+@@ -0,0 +1,11 @@
++// glibc's malloc serializes its arenas behind futexes, and under load the
++// sixteen worker threads spent up to half a millisecond blocked per
++// acquisition. On a 16-core host jemalloc measured 20% more hello-world
++// throughput than glibc (mimalloc 11%), and returned the ~7% of the machine
++// that arena-lock sleeps reported as idle.
++#[global_allocator]
++static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
++
++fn main() -> anyhow::Result<()> {
++    celld::command::run()
++}
+diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
+index eebc44d..648af6f 100644
+--- a/crates/celld/lib.rs
++++ b/crates/celld/lib.rs
+@@ -527,3 +527,8 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
+         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
+     }
+ }
++
++// The CLI is also callable by binaries which register a custom native runtime.
++extern crate self as celld;
++#[path = "main.rs"]
++pub mod command;
+diff --git a/crates/celld/main.rs b/crates/celld/main.rs
+index feb5296..b1a1963 100644
 --- a/crates/celld/main.rs
 +++ b/crates/celld/main.rs
-@@ -3494,6 +3494,8 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
+@@ -41,14 +41,6 @@ use std::sync::Arc;
+ use std::time::Instant;
+ use tokio::sync::{mpsc, oneshot, watch};
+ 
+-// glibc's malloc serializes its arenas behind futexes, and under load the
+-// sixteen worker threads spent up to half a millisecond blocked per
+-// acquisition. On a 16-core host jemalloc measured 20% more hello-world
+-// throughput than glibc (mimalloc 11%), and returned the ~7% of the machine
+-// that arena-lock sleeps reported as idle.
+-#[global_allocator]
+-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+-
+ /// Let an admitted HTTP request finish, then close the transport even when a
+ /// response stream or a client keep-alive does not settle. The semantic drain
+ /// continues after this bound, so durability and resident activity still use
+@@ -3493,7 +3485,11 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
+ /// The walk is O(cached cells), so keep it off the hot maintenance cadence.
  const LOCAL_CACHE_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
  
- fn main() -> anyhow::Result<()> {
+-fn main() -> anyhow::Result<()> {
++pub fn run() -> anyhow::Result<()> {
 +    #[cfg(feature = "monty")]
-+    celld::native::register(&celld_monty::Monty)?;
++    if celld::native::runtime().is_none() {
++        celld::native::register(celld_monty::Monty::new())?;
++    }
      celld::env_vars::validate()?;
      // Parse the telemetry group once, before any command or runtime work.
      // Its specialized values share the strict scalar parsers in env_vars.
-@@ -3607,13 +3609,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+@@ -3607,13 +3603,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
              return Ok(());
          }
          Action::Version => {

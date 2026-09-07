@@ -1,0 +1,4 @@
+{
+  "name": "extended-host",
+  "main": "worker.py"
+}

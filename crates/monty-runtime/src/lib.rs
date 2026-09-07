@@ -1,13 +1,16 @@
 //! Native Python compilation, values, capabilities and suspended executions.
 mod exports;
+mod extensions;
 mod runtime;
 mod value;
+pub use extensions::PythonResult;
+pub use monty_types::{ExcType, MontyException as PythonError, MontyObject as PythonValue};
 pub use runtime::Monty;
 
 /// Editor definitions for the built-in Python module.
 pub const TYPES: &str = include_str!("celld.pyi");
 use monty::{FunctionCall, RunProgress};
-use monty_types::{ExcType, ExtFunctionResult, MontyException, MontyObject, PrintWriter};
+use monty_types::{ExtFunctionResult, MontyException, MontyObject, PrintWriter};
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -80,6 +83,7 @@ pub(crate) struct Session {
     calls: usize,
     rpc: bool,
     response: Option<value::HttpResponse>,
+    extensions: std::sync::Arc<extensions::Extensions>,
 }
 impl Session {
     pub fn start(
@@ -92,6 +96,7 @@ impl Session {
             calls: 0,
             rpc: function.rpc,
             response: None,
+            extensions: function.extensions.clone(),
         };
         let event = session.advance(function.start(args, context)?)?;
         Ok((session, event))
@@ -177,90 +182,142 @@ impl Session {
             .map_err(Failure::python)?;
         self.advance(progress)
     }
-    fn advance(&mut self, progress: RunProgress) -> Result<Value, Failure> {
-        match progress {
-            RunProgress::Complete(result) => {
-                // A caller needs one representation, never both. RPC retains
-                // native type information; HTTP serializes the Python value once.
-                if self.rpc {
-                    // Validate even for RPC: iterators and arbitrary instances
-                    // have no remote value contract in this interface.
-                    value::to_json(&result)?;
-                    let wire = serde_json::to_string(&result).map_err(|e| e.to_string())?;
-                    if wire.len() > 1024 * 1024 {
-                        return Err("result exceeds 1 MiB".into());
-                    }
-                    Ok(json!({"done":true,"wire":wire}))
-                } else {
-                    self.response = Some(value::response(&result)?);
-                    Ok(json!({"done":true}))
-                }
-            }
-            RunProgress::FunctionCall(call) => {
-                self.calls += 1;
-                if self.calls > 10_000 {
-                    return Err("host call limit exceeded".into());
-                }
-                if call.function_name != "_celld_host"
-                    || !call.kwargs.is_empty()
-                    || call.object_id.is_some()
+    fn advance(&mut self, mut progress: RunProgress) -> Result<Value, Failure> {
+        loop {
+            if let RunProgress::FunctionCall(call) = &progress {
+                if let Some((arity, callback)) = self.extensions.functions.get(&call.function_name)
                 {
-                    return Err("unregistered host function".into());
-                }
-                let Some(MontyObject::String(operation)) = call.args.first() else {
-                    return Err("invalid host operation".into());
-                };
-                if !CAPABILITIES.contains(&operation.as_str()) {
-                    return Err("unknown capability".into());
-                }
-                let args = if operation == "object.call" {
-                    let [_, class, id, method, args] = call.args.as_slice() else {
-                        return Err("invalid object call".into());
-                    };
-                    json!([
-                        value::to_json(class)?,
-                        value::to_json(id)?,
-                        value::to_json(method)?,
-                        serde_json::to_string(args).map_err(|e| e.to_string())?
-                    ])
-                } else if operation == "fetch" {
-                    let [_, url, method, headers, body] = call.args.as_slice() else {
-                        return Err("invalid fetch call".into());
-                    };
-                    json!([
-                        value::to_json(url)?,
-                        value::to_json(method)?,
-                        value::to_json(headers)?,
-                        if matches!(body, MontyObject::Bytes(_)) {
-                            Value::Null
-                        } else {
-                            value::to_json(body)?
-                        }
-                    ])
-                } else {
-                    Value::Array(
-                        call.args[1..]
-                            .iter()
-                            .map(value::to_json)
-                            .collect::<Result<_, _>>()?,
-                    )
-                };
-                let body_size = if operation == "fetch" {
-                    match call.args.get(4) {
-                        Some(MontyObject::Bytes(body)) => body.len(),
-                        _ => 0,
+                    self.calls += 1;
+                    if self.calls > 10_000 {
+                        return Err("host call limit exceeded".into());
                     }
-                } else {
-                    0
-                };
-                if args.to_string().len() + body_size > 1024 * 1024 {
-                    return Err("host arguments exceed 1 MiB".into());
+                    let RunProgress::FunctionCall(mut call) = progress else {
+                        unreachable!()
+                    };
+                    let reply = if call.object_id.is_some()
+                        || !call.kwargs.is_empty()
+                        || call.args.len() != *arity
+                    {
+                        Err(PythonError::new(
+                            ExcType::TypeError,
+                            Some("invalid native function arguments".into()),
+                        ))
+                    } else if call.args.iter().fold(0usize, |size, arg| {
+                        size.saturating_add(arg.deep_host_size())
+                    }) > 1024 * 1024
+                    {
+                        Err(PythonError::new(
+                            ExcType::ValueError,
+                            Some("native function arguments exceed 1 MiB".into()),
+                        ))
+                    } else {
+                        callback(std::mem::take(&mut call.args)).and_then(|value| {
+                            if value.deep_host_size() > 1024 * 1024 {
+                                Err(PythonError::new(
+                                    ExcType::ValueError,
+                                    Some("native function result exceeds 1 MiB".into()),
+                                ))
+                            } else {
+                                Ok(value)
+                            }
+                        })
+                    };
+                    progress = call
+                        .resume(
+                            match reply {
+                                Ok(value) => ExtFunctionResult::Return(value),
+                                Err(error) => ExtFunctionResult::Error(error),
+                            },
+                            PrintWriter::Disabled,
+                        )
+                        .map_err(Failure::python)?;
+                    continue;
                 }
-                let event = json!({"done":false,"operation":operation,"args":args});
-                self.pending = Some(call);
-                Ok(event)
             }
-            _ => Err("only registered celld capabilities may suspend execution".into()),
+            return match progress {
+                RunProgress::Complete(result) => {
+                    // A caller needs one representation, never both. RPC retains
+                    // native type information; HTTP serializes the Python value once.
+                    if self.rpc {
+                        // Validate even for RPC: iterators and arbitrary instances
+                        // have no remote value contract in this interface.
+                        value::to_json(&result)?;
+                        let wire = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+                        if wire.len() > 1024 * 1024 {
+                            return Err("result exceeds 1 MiB".into());
+                        }
+                        Ok(json!({"done":true,"wire":wire}))
+                    } else {
+                        self.response = Some(value::response(&result)?);
+                        Ok(json!({"done":true}))
+                    }
+                }
+                RunProgress::FunctionCall(call) => {
+                    self.calls += 1;
+                    if self.calls > 10_000 {
+                        return Err("host call limit exceeded".into());
+                    }
+                    if call.function_name != "_celld_host"
+                        || !call.kwargs.is_empty()
+                        || call.object_id.is_some()
+                    {
+                        return Err("unregistered host function".into());
+                    }
+                    let Some(MontyObject::String(operation)) = call.args.first() else {
+                        return Err("invalid host operation".into());
+                    };
+                    if !CAPABILITIES.contains(&operation.as_str()) {
+                        return Err("unknown capability".into());
+                    }
+                    let args = if operation == "object.call" {
+                        let [_, class, id, method, args] = call.args.as_slice() else {
+                            return Err("invalid object call".into());
+                        };
+                        json!([
+                            value::to_json(class)?,
+                            value::to_json(id)?,
+                            value::to_json(method)?,
+                            serde_json::to_string(args).map_err(|e| e.to_string())?
+                        ])
+                    } else if operation == "fetch" {
+                        let [_, url, method, headers, body] = call.args.as_slice() else {
+                            return Err("invalid fetch call".into());
+                        };
+                        json!([
+                            value::to_json(url)?,
+                            value::to_json(method)?,
+                            value::to_json(headers)?,
+                            if matches!(body, MontyObject::Bytes(_)) {
+                                Value::Null
+                            } else {
+                                value::to_json(body)?
+                            }
+                        ])
+                    } else {
+                        Value::Array(
+                            call.args[1..]
+                                .iter()
+                                .map(value::to_json)
+                                .collect::<Result<_, _>>()?,
+                        )
+                    };
+                    let body_size = if operation == "fetch" {
+                        match call.args.get(4) {
+                            Some(MontyObject::Bytes(body)) => body.len(),
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    if args.to_string().len() + body_size > 1024 * 1024 {
+                        return Err("host arguments exceed 1 MiB".into());
+                    }
+                    let event = json!({"done":false,"operation":operation,"args":args});
+                    self.pending = Some(call);
+                    Ok(event)
+                }
+                _ => Err("only registered celld capabilities may suspend execution".into()),
+            };
         }
     }
 }

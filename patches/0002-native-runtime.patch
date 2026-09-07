@@ -528,15 +528,15 @@ index 0000000..f0c30e4
 +pub use celld_runtime::*;
 +use std::{path::Path, sync::OnceLock};
 +
-+static RUNTIME: OnceLock<&'static dyn Runtime> = OnceLock::new();
++static RUNTIME: OnceLock<Box<dyn Runtime>> = OnceLock::new();
 +
-+pub fn register(runtime: &'static dyn Runtime) -> anyhow::Result<()> {
++pub fn register(runtime: impl Runtime + 'static) -> anyhow::Result<()> {
 +    RUNTIME
-+        .set(runtime)
++        .set(Box::new(runtime))
 +        .map_err(|_| anyhow::anyhow!("native runtime already registered"))
 +}
 +pub fn runtime() -> Option<&'static dyn Runtime> {
-+    RUNTIME.get().copied()
++    RUNTIME.get().map(Box::as_ref)
 +}
 +pub(crate) fn is_entry(entry: &str) -> bool {
 +    runtime().is_some_and(|r| {

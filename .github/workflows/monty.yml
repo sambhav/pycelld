@@ -1,7 +1,7 @@
 name: Native Monty
 on:
   pull_request:
-    paths: ['Cargo.*', '.cargo/**', 'xtask/**', 'patches/**', 'upstream/**', 'tests/**', 'crates/**', 'examples/monty/**', 'tools/monty-checks/**', 'tools/release.py', 'tools/test_release.py', '.github/workflows/monty.yml', '.github/workflows/release.yml']
+    paths: ['Cargo.*', '.cargo/**', 'src/**', 'vendor/**', 'xtask/**', 'patches/**', 'upstream/**', 'tests/**', 'crates/**', 'examples/**', 'tools/monty-checks/**', 'tools/release.py', 'tools/test_release.py', '.github/workflows/monty.yml', '.github/workflows/release.yml']
   workflow_dispatch:
   workflow_call:
 permissions:
@@ -34,3 +34,4 @@ jobs:
       - run: cargo xtask test
       - run: cargo xtask build
       - run: python tools/monty-checks/e2e.py target/lab/celld
+      - run: python tools/monty-checks/consumer.py

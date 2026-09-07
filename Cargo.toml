@@ -1,6 +1,32 @@
+[package]
+name = "pycelld"
+version = "0.4.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "The patched celld host with an extensible native Monty runtime"
+repository = "https://github.com/sambhav/pycelld"
+publish = false
+autotests = false
+
+[[example]]
+name = "extended-host"
+path = "examples/extended-host/main.rs"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+anyhow = "1"
+celld = { path = "vendor/celld/crates/celld", features = ["monty"] }
+celld-monty = { path = "crates/monty-runtime" }
+celld-runtime = { path = "crates/runtime-api" }
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"], optional = true }
+
 [workspace]
 resolver = "2"
 members = ["crates/monty-runtime", "crates/runtime-api"]
+exclude = ["vendor/celld"]
 
 [profile.release]
 lto = "fat"

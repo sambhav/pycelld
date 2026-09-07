@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 fn register() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| celld::native::register(&celld_monty::Monty).unwrap());
+    ONCE.call_once(|| celld::native::register(celld_monty::Monty::new()).unwrap());
 }
 // Production's process domain retains its first Tokio handle, including the
 // HTTP stream sweeper. Independent short-lived test runtimes can close that

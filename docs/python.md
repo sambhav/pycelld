@@ -3,6 +3,9 @@
 Point `main` at a Python file. Monty is built into celld; no Python installation,
 SDK, bundler or runtime setting is needed.
 
+Custom hosts can [add typed Python functions, classes, and Rust callbacks](extensions.md)
+to the `celld` import using the `pycelld` Rust crate.
+
 `wrangler.jsonc`:
 
 ```json

@@ -3,10 +3,10 @@
 Write Python handlers and durable objects on [celld](https://github.com/denoland/celld),
 with [Monty](https://github.com/pydantic/monty) executing entirely in Rust.
 
-This repository maintains two Rust crates and three patches against a pinned
-celld release. `cargo xtask build` fetches upstream, applies the patches, and
-links Monty into the ordinary celld binary. An upstream source copy or hosted
-fork is not needed in this repository.
+Use the supplied binary, or import the `pycelld` Rust crate to build a host with
+your own Monty functions and classes. The crate includes the patched celld host;
+applications need no patch commands or separate celld fork. Three maintained
+patches reproduce the included host sources from celld 0.4.1.
 
 ## Build and run
 
@@ -20,14 +20,14 @@ Use Git and Rust 1.98.1. TypeScript bundling also requires `esbuild` on `PATH`;
 Python deployment does not invoke it.
 
 ```sh
-cargo xtask build
+cargo build --locked --profile lab
 ./target/lab/celld dev examples/monty
 ```
 
 The default build uses celld's optimized `lab` profile. For a release binary:
 
 ```sh
-cargo xtask build --release
+cargo build --locked --release
 ./target/release/celld types > celld.pyi
 ```
 
@@ -71,6 +71,10 @@ See the [Python API](docs/python.md) and [complete example](examples/monty/worke
 
 ## Rust integration
 
+- [`pycelld`](src/lib.rs) includes the patched host, Monty, and the runtime API.
+  Configure `Monty::new().with_function(...).with_python(...)`, then call
+  `pycelld::run(runtime)` from your binary. See [extending Monty](docs/extensions.md)
+  and the [custom host example](examples/extended-host/main.rs).
 - [`celld-runtime`](crates/runtime-api/src/lib.rs) defines compilation, suspended
   execution, typed host calls, and native response buffers.
 - [`celld-monty`](crates/monty-runtime) implements that contract. It has no
@@ -87,8 +91,10 @@ interpreter process. The pinned upstream revision is recorded in
 
 ```sh
 cargo xtask prepare  # fetch and apply patches, without compiling celld
+cargo xtask vendor --check  # verify included host sources match the patches
 cargo xtask test     # runtime, host integration, and build-workflow tests
 python3 tools/monty-checks/e2e.py target/lab/celld
+python3 tools/monty-checks/consumer.py  # separate Git dependency, types, HTTP
 ```
 
 - [Builds, patch maintenance, and the runtime boundary](docs/build.md)
