@@ -3,6 +3,25 @@
 The host-options patch adds optional CPU cell density and S3 ETag spelling settings to celld
 0.4.1. Neither changes the storage protocol or adds an external dependency.
 
+## Cell packing
+
+`CELLD_MAX_CELLS_PER_ISOLATE` sets the maximum resident cells per worker slot
+(1–32, default 32). It applies to both Monty and TypeScript. Lower values spread
+CPU work across more slots; they can also increase memory use. Monty slots run
+in Rust and do not create V8 heaps. `CELLD_MAX_STATELESS_ISOLATES` limits only
+stateless workers; resident-cell and memory limits govern cell admission.
+
+The fork retains upstream's packing and eviction decisions: new cells fill the
+fullest available slot, while pressure favors evictable cells in the sparsest
+slots. Empty slots retire after their outstanding requests finish. The 0.4.1
+process-wide worker identities distinguish slots across scripts, deployment
+generations, and reuse, including Monty slots.
+
+This packing within a node is separate from 0.4.1's fleet balancing, which moves
+hibernated cells between nodes. A resident cell must hibernate before it can
+move; `CELLD_IDLE_EVICT_S` enables eviction after an idle interval. Lowering the
+packing limit alone does not redistribute ownership across nodes.
+
 ## Ceph and S3 ETag compatibility
 
 celld 0.4.0 already accepts bare ETags and preserves their exact spelling. Current

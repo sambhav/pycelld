@@ -14,6 +14,12 @@ cancellation and capacity, deployment compilation, host configuration, cell
 placement, error/cancellation durability positions, sync proof refusal, paged
 SQLite activation, and reproducible patch preparation.
 
+Native pool regressions exercise concurrent cell placement at densities 1, 2,
+and 32, packing after eviction, suspension across retirement, reclaiming drained
+workers, and distinct worker identities across pools and reused slots. These
+run real Monty workers without initializing V8. They do not measure RSS savings
+or exercise fleet rebalancing against a remote object store.
+
 The release tests cover numeric versioning, concurrent build completion order,
 idempotent reruns, draft recovery, and refusal to replace mismatched tags or assets.
 

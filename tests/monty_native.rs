@@ -2,6 +2,8 @@
 //! tests exercise the same worker facade and continuations as the live pool.
 use celld::deploy::{build, Options};
 use celld::js::{Compat, HttpResponse, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
+use celld::pool::Pool;
+use celld_logic::isolate::PoolLimits;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -124,6 +126,122 @@ async fn native_suspension_body_limits_and_cancellation_release_capacity() {
     worker.turn_deliver(&mut entry, id, op.await);
     assert_eq!(reply.await.unwrap().unwrap().status, 413);
     assert!(entry.finished());
+}
+
+fn pool(config: Arc<WorkerConfig>, density: usize) -> Pool {
+    Pool::new(
+        PoolLimits {
+            grow_at: 2,
+            shrink_under: 1,
+            max_stateless: 1,
+            max_requests: None,
+            max_cells: density,
+        },
+        std::time::Duration::ZERO,
+        Box::new(move || {
+            let worker = Worker::load_config(config.clone())?;
+            assert!(matches!(worker, Worker::Native(_)));
+            Ok(worker)
+        }),
+    )
+}
+
+#[test]
+fn native_cell_packing_keeps_the_density_bound_under_concurrent_activation() {
+    let config = config("def run(): return 1");
+    for density in [1, 2, 32] {
+        let pool = Arc::new(pool(config.clone(), density));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..5)
+                        .map(|_| pool.place_cell().unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let residents = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let mut occupancy = std::collections::BTreeMap::new();
+        for resident in &residents {
+            *occupancy.entry(resident.slot().heap_id()).or_insert(0) += 1;
+        }
+        assert_eq!(residents.len(), 40);
+        assert_eq!(occupancy.len(), 40_usize.div_ceil(density));
+        assert!(occupancy.values().all(|&cells| cells <= density));
+        // The stateless ceiling of one must not constrain cell placement.
+        assert_eq!(pool.live(), occupancy.len());
+        drop(residents);
+        pool.reap_empty();
+        assert!(pool.is_drained());
+    }
+}
+
+#[tokio::test]
+async fn native_packing_drains_suspended_workers_and_preserves_global_identity() {
+    let config = config("async def run(ctx):\n    await ctx.sleep(0)\n    return b'complete'");
+    let pool = pool(config.clone(), 3);
+    let a = pool.place_cell().unwrap();
+    let b = pool.place_cell().unwrap();
+    let c = pool.place_cell().unwrap();
+    let d = pool.place_cell().unwrap();
+    assert_eq!(a.slot().heap_id(), c.slot().heap_id());
+    assert_ne!(a.slot().heap_id(), d.slot().heap_id());
+
+    // Eviction has opened holes in two workers. Fill the fullest one so the
+    // sparse worker can reach zero instead of continually being refilled.
+    drop(b);
+    let e = pool.place_cell().unwrap();
+    assert_eq!(e.slot().heap_id(), a.slot().heap_id());
+
+    // A distinct script/generation may reuse a slot index, never its identity.
+    let other = self::pool(config, 3);
+    let other_cell = other.place_cell().unwrap();
+    assert_eq!(other_cell.slot().id, a.slot().id);
+    assert_ne!(other_cell.slot().heap_id(), a.slot().heap_id());
+
+    let sparse = d.slot().clone();
+    let affiliation = sparse.affiliate();
+    let (job, reply) = request(RequestBody::Bytes("{}".into()));
+    let (entry, mut ops) = sparse.turn(|worker| worker.turn_begin(job, None)).await;
+    let mut entry = entry.unwrap();
+    assert!(!entry.finished());
+    assert_eq!(ops.len(), 1);
+    drop(d);
+    pool.reap_empty();
+    assert!(sparse.is_retiring());
+    assert!(!a.slot().is_retiring());
+
+    // An empty but suspended worker cannot be freed or reused.
+    let f = pool.place_cell().unwrap();
+    assert_ne!(f.slot().id, sparse.id);
+    let (id, operation) = ops.pop().unwrap();
+    let result = operation.await;
+    sparse
+        .turn(|worker| worker.turn_deliver(&mut entry, id, result))
+        .await;
+    assert!(entry.finished());
+    assert_eq!(reply.await.unwrap().unwrap().body, b"complete");
+    drop(entry);
+    drop(affiliation);
+    drop(f);
+    pool.reap_empty();
+
+    // Once drained, the stable slot index is reusable with a fresh identity.
+    let replacement = pool.place_cell().unwrap();
+    assert_eq!(replacement.slot().id, sparse.id);
+    assert_ne!(replacement.slot().heap_id(), sparse.heap_id());
+    drop((a, c, e, replacement, other_cell));
+    pool.reap_empty();
+    other.reap_empty();
+    assert!(pool.is_drained());
+    assert!(other.is_drained());
 }
 
 fn options(config: std::path::PathBuf) -> Options {
