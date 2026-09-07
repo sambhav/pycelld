@@ -12,7 +12,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-binaries-${{ github.event.pull_request.number || github.ref }}
+  # Main pushes each get a release; only superseded PR builds are cancelled.
+  group: native-binaries-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -74,6 +75,8 @@ jobs:
             pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
             pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-
       - run: cargo xtask prepare
+      - name: Set the fork release version
+        run: echo "CELLD_RELEASE_VERSION=$(python3 tools/release.py version)" >> "$GITHUB_ENV"
       - name: Test cell packing and retirement
         run: cargo test --manifest-path tools/packing-checks/Cargo.toml --locked
       - name: Build release binary
@@ -104,7 +107,8 @@ jobs:
           import gzip, hashlib, json, os, pathlib, subprocess, tomllib
           target = os.environ['TARGET']
           binary = pathlib.Path(f'target/{target}/release/celld')
-          version = tomllib.loads(pathlib.Path('target/celld/crates/celld/Cargo.toml').read_text())['package']['version']
+          upstream_version = tomllib.loads(pathlib.Path('target/celld/crates/celld/Cargo.toml').read_text())['package']['version']
+          version = os.environ['CELLD_RELEASE_VERSION']
           reported = subprocess.check_output([str(binary), '--version'], text=True).strip()
           assert reported == f'celld {version}', reported
           source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
@@ -116,6 +120,8 @@ jobs:
           assert gzip.decompress(archive.read_bytes()) == binary.read_bytes()
           (out / f'build-{target}.json').write_text(json.dumps({
               'target': target, 'version': version, 'source_sha': source,
+              'upstream_version': upstream_version,
+              'build_number': int(os.environ['GITHUB_RUN_NUMBER']),
               'repository': os.environ['GITHUB_REPOSITORY'],
               'upstream_revision': pathlib.Path('upstream/revision').read_text().strip(),
               'rust_version': os.environ['RUST_VERSION'], 'profile': 'release',
@@ -149,15 +155,20 @@ jobs:
         run: |
           python3 - <<'PY'
           import gzip, hashlib, json, os, pathlib, shutil
+          from tools.release import release_version
           assets = pathlib.Path('assets')
           targets = {'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-apple-darwin'}
           builds = [json.loads(p.read_text()) for p in sorted(assets.glob('build-*.json'))]
           assert len(builds) == len(targets)
           assert {b['target'] for b in builds} == targets
           assert len({b['version'] for b in builds}) == 1
+          assert len({b['upstream_version'] for b in builds}) == 1
           checksums = []
           for b in builds:
               assert b['source_sha'] == os.environ['SOURCE_SHA']
+              assert b['build_number'] == int(os.environ['GITHUB_RUN_NUMBER'])
+              assert b['version'] == release_version(b['upstream_version'], b['build_number'])
+              assert b['upstream_revision'] == pathlib.Path('upstream/revision').read_text().strip()
               assert b['repository'] == os.environ['GITHUB_REPOSITORY']
               assert b['profile'] == 'release'
               assert b['archive'] == f"celld-{b['target']}.gz"
@@ -185,9 +196,16 @@ jobs:
       github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    concurrency:
+      group: celld-release-publish
+      queue: max
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: celld-release-assets
@@ -196,21 +214,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          version=$(python3 -c 'import json; print(json.load(open("assets/BUILD_INFO.json"))[0]["version"])')
-          tag="v$version-pycelld.${SOURCE_SHA:0:12}"
-          python3 - <<'PY'
-          import os, pathlib
-          pathlib.Path('notes.md').write_text(
-              'Monty-enabled celld build from `' + os.environ['SOURCE_SHA'] + '`.\n\n'
-              'Python handlers, typed context, and durable objects run natively in Rust.\n\n'
-              'Includes configurable cell density and opt-in S3 ETag spelling compatibility.\n\n'
-              'Linux x86-64/ARM64 and macOS Intel/Apple Silicon binaries passed the same '
-              'configuration, placement, S3 conditional-write, and Monty HTTP/durability checks on native GitHub runners.\n\n'
-              'Verify downloads against `SHA256SUMS`; `BUILD_INFO.json` records source and toolchain. '
-              'macOS binaries are not Apple-notarized.\n')
-          PY
-          # Do not replace an existing release or move an existing tag.
-          gh release create "$tag" --prerelease --target "$SOURCE_SHA" \
-            --title "celld $version with Monty (${SOURCE_SHA:0:12})" --notes-file notes.md assets/*
+        run: python3 tools/release.py publish

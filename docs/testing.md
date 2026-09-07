@@ -1,6 +1,7 @@
 # Validation
 
 ```sh
+python3 -m unittest discover -s tools -p test_release.py -v
 cargo xtask test
 cargo xtask build
 python3 tools/monty-checks/e2e.py target/lab/celld
@@ -12,6 +13,9 @@ boundary, a second runtime using the public extension API, native worker
 cancellation and capacity, deployment compilation, host configuration, cell
 placement, error/cancellation durability positions, sync proof refusal, paged
 SQLite activation, and reproducible patch preparation.
+
+The release tests cover numeric versioning, concurrent build completion order,
+idempotent reruns, draft recovery, and refusal to replace mismatched tags or assets.
 
 The end-to-end test starts local celld processes and checks real HTTP responses,
 POST routing, dataclasses, buffered bytes, native fetch, durable calls,

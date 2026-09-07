@@ -64,19 +64,43 @@ The **Native binaries** workflow builds native release binaries for:
 - Linux x86-64 and ARM64 (GNU/glibc, built on Ubuntu 22.04).
 - macOS Intel and Apple Silicon (built on macOS 15).
 
-Every push to `main` builds and publishes a GitHub prerelease after all four
-platforms pass. You can also run **Native binaries** manually from `main` in
-GitHub Actions. Label a PR `build-binaries` to build downloadable review
+Every push to `main` builds and publishes a normal GitHub release after all four
+platforms and the Rust, typing, and HTTP validation suite pass. No manual version
+bump or tag is needed. You can also run **Native binaries** manually from `main`
+in GitHub Actions. Label a PR `build-binaries` to build downloadable review
 artifacts; PRs do not publish releases.
 
-Download binaries from [pycelld Releases](https://github.com/sambhav/pycelld/releases).
-Each release is named `v<celld-version>-pycelld.<commit-prefix>` and records the
-exact source commit. Published releases and tags are never overwritten. A
-failed platform prevents publication of an incomplete release.
+Download the [latest pycelld release](https://github.com/sambhav/pycelld/releases/latest).
+Tags use `v<upstream-version>-pycelld.<build-number>`:
+
+| Upstream celld | Workflow run | Published version |
+| --- | ---: | --- |
+| `0.4.1` | 4 | `0.4.1-pycelld.4` |
+| `0.4.1` | 5 | `0.4.1-pycelld.5` |
+| `0.4.2` | 6 | `0.4.2-pycelld.6` |
+
+The build number is GitHub's `run_number` for **Native binaries**. It increases
+automatically and does not reset when upstream changes. Failed runs, PR builds,
+and manual runs can leave gaps. Rerunning a workflow keeps the same number.
+
+The suffix identifies this distribution and orders its builds numerically.
+[SemVer](https://semver.org/#spec-item-9) places a suffixed version before the
+corresponding plain upstream version; compare fork versions within pycelld.
+These are normal releases in this repository, so GitHub's **Latest** link works.
+The highest successfully published build number becomes Latest, even when
+builds finish out of order. Publication is queued; new main pushes do not cancel
+earlier builds.
+
+`celld --version` reports the full fork version. Local builds report
+`<upstream-version>-pycelld.dev`. The manifest records both the fork and upstream
+versions, the build number, and exact source commits. Published releases and
+tags are never overwritten. Reruns verify existing assets; interrupted draft
+uploads can resume. A failed check prevents publication of an incomplete release.
 
 The release includes four `celld-<target>.gz` files, `SHA256SUMS`,
-`BUILD_INFO.json`, `celld.pyi` for editor types, and the license. The manifest records source, target, Rust
-version, build profile, and checksums of compressed and uncompressed binaries.
+`BUILD_INFO.json`, `celld.pyi` for editor types, and the license. The manifest also
+records target, Rust version, build profile, and checksums of compressed and
+uncompressed binaries.
 Download the target for your machine and `SHA256SUMS`, then for example:
 
 ```sh

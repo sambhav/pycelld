@@ -1,4 +1,4 @@
-diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+diff --git b/crates/celld/Cargo.toml a/crates/celld/Cargo.toml
 index 38e21b0..83b4279 100644
 --- a/crates/celld/Cargo.toml
 +++ b/crates/celld/Cargo.toml
@@ -19,8 +19,8 @@ index 38e21b0..83b4279 100644
  celld-runtime = { path = "../../../../crates/runtime-api" }
  async-trait.workspace = true
  chrono.workspace = true
-diff --git a/crates/celld/main.rs b/crates/celld/main.rs
-index feb5296..dd6e2ae 100644
+diff --git b/crates/celld/main.rs a/crates/celld/main.rs
+index feb5296..596676b 100644
 --- a/crates/celld/main.rs
 +++ b/crates/celld/main.rs
 @@ -3494,6 +3494,8 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
@@ -32,3 +32,20 @@ index feb5296..dd6e2ae 100644
      celld::env_vars::validate()?;
      // Parse the telemetry group once, before any command or runtime work.
      // Its specialized values share the strict scalar parsers in env_vars.
+@@ -3607,13 +3609,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+             return Ok(());
+         }
+         Action::Version => {
++            let version = option_env!("CELLD_RELEASE_VERSION")
++                .unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-pycelld.dev"));
+             let profile = if cfg!(debug_assertions) {
+                 " (debug)"
+             } else {
+                 ""
+             };
+             celld::cli_output::Output::new(celld::cli_output::Format::Text)
+-                .line(format_args!("celld {}{profile}", env!("CARGO_PKG_VERSION")))?;
++                .line(format_args!("celld {version}{profile}"))?;
+             return Ok(());
+         }
+         Action::Diagnose {
