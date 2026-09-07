@@ -108,7 +108,7 @@ async def fetched_bytes(ctx: Context, url: str):
     log_path = root / "server.log"
     def request(name, args=None):
         return Request(url+"/"+name, data=json.dumps(args or {}).encode(), headers={"content-type":"application/json"})
-    def call(name, args=None):
+    def call(name, args=None, *, during_reload=False):
         try:
             with urlopen(request(name,args),timeout=30) as response:
                 body = response.read()
@@ -116,7 +116,10 @@ async def fetched_bytes(ctx: Context, url: str):
                 if "application/json" in response.headers.get("content-type", ""): return json.loads(body)
                 return body.decode()
         except HTTPError as error:
-            raise AssertionError(f"{name}: {error.code}: {error.read().decode()}") from error
+            body = error.read().decode()
+            if during_reload and error.code == 503 and json.loads(body) == {"ok": False, "draining": True}:
+                return None
+            raise AssertionError(f"{name}: {error.code}: {body}") from error
     def start(log):
         process = subprocess.Popen([binary,"dev",str(project),"--port",str(port),"--logs"],env=env,stdout=log,stderr=log)
         deadline = time.monotonic()+120
@@ -217,7 +220,7 @@ async def fetched_bytes(ctx: Context, url: str):
             deadline=time.monotonic()+45
             while True:
                 try:
-                    if call("hello") == "Welcome, world!": break
+                    if call("hello", during_reload=True) == "Welcome, world!": break
                 except (URLError, ConnectionError, http.client.HTTPException):
                     pass  # Dev reload briefly closes and reopens the listener.
                 assert process.poll() is None, "dev process exited during reload"
