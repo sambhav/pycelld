@@ -62,22 +62,20 @@ python3 tools/storage-checks/probe.py target/release/celld -v
 The **Native binaries** workflow builds native release binaries for:
 
 - Linux x86-64 and ARM64 (GNU/glibc, built on Ubuntu 22.04).
-- macOS Intel and Apple Silicon (built on macOS 15 and 14 respectively).
+- macOS Intel and Apple Silicon (built on macOS 15).
 
-Label a PR `build-binaries` to produce GitHub Actions artifacts. Label a PR in
-this repository `release-binaries` to also create a draft release after all four
-platforms pass. A manual workflow run or a push to `candidate` creates a draft
-as well. The workflow file must exist on the default branch for the manual
-Actions button to be available.
+Every push to `main` builds and publishes a GitHub prerelease after all four
+platforms pass. You can also run **Native binaries** manually from `main` in
+GitHub Actions. Label a PR `build-binaries` to build downloadable review
+artifacts; PRs do not publish releases.
 
-Each draft is named `v<celld-version>-fork.<commit-prefix>` and targets the exact
-source commit used by every build. The workflow never moves `main`, replaces a
-release, or overwrites a published tag. Review the draft in GitHub Releases and
-publish it when ready. This workflow publishes native binaries; it has no
-upstream container registry destination.
+Download binaries from [pycelld Releases](https://github.com/sambhav/pycelld/releases).
+Each release is named `v<celld-version>-pycelld.<commit-prefix>` and records the
+exact source commit. Published releases and tags are never overwritten. A
+failed platform prevents publication of an incomplete release.
 
 The release includes four `celld-<target>.gz` files, `SHA256SUMS`,
-`BUILD_INFO.json` and the license. The manifest records source, target, Rust
+`BUILD_INFO.json`, `celld.pyi` for editor types, and the license. The manifest records source, target, Rust
 version, build profile, and checksums of compressed and uncompressed binaries.
 Download the target for your machine and `SHA256SUMS`, then for example:
 
@@ -89,6 +87,6 @@ chmod +x celld
 ./celld --version
 ```
 
-On macOS, use `shasum -a 256 --check` for verification. These fork binaries are
+On macOS, use `shasum -a 256 --check` for verification. These binaries are
 not signed or notarized by Apple. The binary includes the native Monty runtime;
 see the [Python guide](python.md) for handlers and durable objects.

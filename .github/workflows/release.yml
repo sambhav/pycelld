@@ -1,19 +1,18 @@
 name: Native binaries
 
-# PRs build review artifacts. Label a same-repository PR `release-binaries`,
-# push `candidate`, or run manually to also create an immutable-source draft.
+# Main publishes tested binaries. A labeled PR builds review artifacts only.
 on:
   pull_request:
     types: [labeled, synchronize]
   push:
-    branches: [candidate]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: fork-binaries-${{ github.event.pull_request.number || github.ref }}
+  group: native-binaries-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -25,8 +24,7 @@ jobs:
   build:
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'build-binaries') ||
-      contains(github.event.pull_request.labels.*.name, 'release-binaries')
+      contains(github.event.pull_request.labels.*.name, 'build-binaries')
     name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -36,7 +34,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -65,8 +63,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: fork-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-${{ env.SOURCE_SHA }}
-          restore-keys: fork-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
+          key: pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-${{ env.SOURCE_SHA }}
+          restore-keys: |
+            pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
+            pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-
       - run: cargo xtask prepare
       - name: Test configuration and placement
         run: cargo test --manifest-path tools/packing-checks/Cargo.toml --locked
@@ -83,6 +83,11 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Test S3 ETag spelling and conditional-write fencing through the binary
         run: python3 tools/storage-checks/probe.py "target/$TARGET/release/celld" -v
+      - name: Test native Monty HTTP and durability
+        run: |
+          python3 tools/monty-checks/e2e.py "target/$TARGET/release/celld"
+          "target/$TARGET/release/celld" types > generated.pyi
+          cmp generated.pyi crates/monty-runtime/src/celld.pyi
       - name: Package and verify binary
         run: |
           set -euo pipefail
@@ -157,6 +162,7 @@ jobs:
           (assets / 'SHA256SUMS').write_text('\n'.join(sorted(checksums)) + '\n')
           (assets / 'BUILD_INFO.json').write_text(json.dumps(builds, indent=2) + '\n')
           shutil.copy('LICENSE', assets / 'LICENSE')
+          shutil.copy('crates/monty-runtime/src/celld.pyi', assets / 'celld.pyi')
           for p in assets.glob('build-*.json'): p.unlink()
           PY
       - uses: actions/upload-artifact@v4
@@ -166,13 +172,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  draft-release:
-    name: Create fork draft release
+  publish:
+    name: Publish celld binaries
     needs: assemble
     if: >-
-      github.event_name != 'pull_request' ||
-      (contains(github.event.pull_request.labels.*.name, 'release-binaries') &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -182,24 +186,25 @@ jobs:
         with:
           name: celld-release-assets
           path: assets
-      - name: Create draft with exact source and all verified assets
+      - name: Publish exact source and all verified assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           version=$(python3 -c 'import json; print(json.load(open("assets/BUILD_INFO.json"))[0]["version"])')
-          tag="v$version-fork.${SOURCE_SHA:0:12}"
+          tag="v$version-pycelld.${SOURCE_SHA:0:12}"
           python3 - <<'PY'
           import os, pathlib
           pathlib.Path('notes.md').write_text(
-              'Native celld fork build from `' + os.environ['SOURCE_SHA'] + '`.\n\n'
+              'Monty-enabled celld build from `' + os.environ['SOURCE_SHA'] + '`.\n\n'
+              'Python handlers, typed context, and durable objects run natively in Rust.\n\n'
               'Includes configurable cell density and opt-in S3 ETag spelling compatibility.\n\n'
               'Linux x86-64/ARM64 and macOS Intel/Apple Silicon binaries passed the same '
-              'configuration, placement, and S3 conditional-write checks on native GitHub runners.\n\n'
+              'configuration, placement, S3 conditional-write, and Monty HTTP/durability checks on native GitHub runners.\n\n'
               'Verify downloads against `SHA256SUMS`; `BUILD_INFO.json` records source and toolchain. '
               'macOS binaries are not Apple-notarized.\n')
           PY
           # Do not replace an existing release or move an existing tag.
-          gh release create "$tag" --draft --prerelease --target "$SOURCE_SHA" \
-            --title "celld $version — fork ${SOURCE_SHA:0:12}" --notes-file notes.md assets/*
+          gh release create "$tag" --prerelease --target "$SOURCE_SHA" \
+            --title "celld $version with Monty (${SOURCE_SHA:0:12})" --notes-file notes.md assets/*

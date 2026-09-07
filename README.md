@@ -10,6 +10,10 @@ fork is not needed in this repository.
 
 ## Build and run
 
+[Download celld binaries](https://github.com/sambhav/pycelld/releases) for Linux
+and macOS, on x86-64 and ARM64. Each `main` build publishes a tested prerelease
+with checksums and Python editor types. See [installation](docs/fork.md#download-and-release-binaries).
+
 Use Git and Rust 1.98.1. TypeScript bundling also requires `esbuild` on `PATH`;
 Python deployment does not invoke it.
 
