@@ -55,7 +55,7 @@ index f2f5aec..8011072 100644
          .collect::<Vec<_>>()
          .join(",");
 diff --git a/crates/celld/deploy.rs b/crates/celld/deploy.rs
-index 8de21e1..d6c9f1c 100644
+index 8de21e1..2ba9ebc 100644
 --- a/crates/celld/deploy.rs
 +++ b/crates/celld/deploy.rs
 @@ -447,13 +447,29 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
@@ -67,7 +67,7 @@ index 8de21e1..d6c9f1c 100644
 +    let is_native = project
 +        .entry
 +        .as_deref()
-+        .is_some_and(crate::native::is_entry);
++        .is_some_and(|entry| crate::native::is_entry(&root, entry));
      let started = Instant::now();
      let built_assets = project.assets.as_ref().map(build_assets).transpose()?;
      let bundle = project
@@ -125,13 +125,26 @@ index 8de21e1..d6c9f1c 100644
              if built_assets.is_some() {
                  features.push(FEATURE_ASSETS_V1.to_string());
              }
-@@ -1543,6 +1575,19 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
+@@ -1014,8 +1046,10 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
+         let entry = root.join(main);
+         let metadata = std::fs::symlink_metadata(&entry)
+             .with_context(|| format!("inspect entry point {}", entry.display()))?;
+-        if !metadata.file_type().is_file() {
+-            bail!("entry point {} is not a regular file", entry.display());
++        if !metadata.file_type().is_file()
++            && !(metadata.file_type().is_dir() && crate::native::is_entry(root, main))
++        {
++            bail!("entry point {} is not a regular file or supported runtime package", entry.display());
+         }
+     }
+     let no_bundle = match object.get("no_bundle") {
+@@ -1543,6 +1577,19 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
              );
          }
      }
 +    // Class identity and SQLite registration come from Native source.
-+    if main.as_deref().is_some_and(crate::native::is_entry) {
-+        let source = std::fs::read_to_string(root.join(main.as_deref().unwrap()))?;
++    if main.as_deref().is_some_and(|entry| crate::native::is_entry(&root, entry)) {
++        let source = crate::native::runtime().unwrap().bundle(root, Path::new(main.as_deref().unwrap()))?;
 +        for class in crate::native::compile(&source)?.classes().iter().cloned() {
 +            if do_classes.contains(&class) || sqlite_classes.contains(&class) {
 +                bail!(
@@ -467,23 +480,41 @@ index 6c63ffa..eebc44d 100644
  #[cfg(celld_internal_tests)]
  #[allow(clippy::disallowed_methods)]
 diff --git a/crates/celld/main.rs b/crates/celld/main.rs
-index d09ef61..feb5296 100644
+index d09ef61..9f9feba 100644
 --- a/crates/celld/main.rs
 +++ b/crates/celld/main.rs
-@@ -3574,6 +3574,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+@@ -3574,6 +3574,36 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
      let mut settings = match action {
          Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
          Action::Dev(arguments) => return celld::dev::run(arguments).await,
 +        Action::Types(arguments) => {
-+            if !arguments.is_empty() {
-+                anyhow::bail!("usage: celld types > celld.pyi");
++            let runtime = celld::native::runtime()
++                .ok_or_else(|| anyhow::anyhow!("no native runtime is registered"))?;
++            if arguments.is_empty() {
++                if runtime.type_files().len() > 1 {
++                    anyhow::bail!("multiple type modules are registered; use celld types DIRECTORY");
++                }
++                print!("{}", runtime.types());
++            } else if let [directory] = arguments.as_slice() {
++                let root = std::path::Path::new(directory);
++                std::fs::create_dir_all(root)?;
++                let root = root.canonicalize()?;
++                for (name, source) in runtime.type_files() {
++                    let relative = std::path::Path::new(&name);
++                    if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
++                        anyhow::bail!("invalid runtime type path: {name}");
++                    }
++                    let path = root.join(relative);
++                    let parent = path.parent().unwrap();
++                    std::fs::create_dir_all(parent)?;
++                    if !parent.canonicalize()?.starts_with(&root) || path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
++                        anyhow::bail!("runtime type path escapes the output directory: {name}");
++                    }
++                    std::fs::write(path, source)?;
++                }
++            } else {
++                anyhow::bail!("usage: celld types [DIRECTORY]");
 +            }
-+            print!(
-+                "{}",
-+                celld::native::runtime()
-+                    .map(|r| r.types())
-+                    .unwrap_or_default()
-+            );
 +            return Ok(());
 +        }
          Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
@@ -513,16 +544,16 @@ index d3afa8e..80a6c21 100644
    celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
    celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
    celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
-+  celld types > runtime.types         Write types for the registered native runtime
++  celld types [DIRECTORY]            Write native runtime types (stdout or import tree)
    celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
    celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
    celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
 diff --git a/crates/celld/native.rs b/crates/celld/native.rs
 new file mode 100644
-index 0000000..f0c30e4
+index 0000000..67388b0
 --- /dev/null
 +++ b/crates/celld/native.rs
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,35 @@
 +//! Register one statically linked native runtime before starting celld.
 +//! The ordinary JavaScript worker path remains available alongside it.
 +pub use celld_runtime::*;
@@ -538,12 +569,8 @@ index 0000000..f0c30e4
 +pub fn runtime() -> Option<&'static dyn Runtime> {
 +    RUNTIME.get().map(Box::as_ref)
 +}
-+pub(crate) fn is_entry(entry: &str) -> bool {
-+    runtime().is_some_and(|r| {
-+        Path::new(entry)
-+            .extension()
-+            .is_some_and(|e| e == r.descriptor().extension)
-+    })
++pub(crate) fn is_entry(root: &Path, entry: &str) -> bool {
++    runtime().is_some_and(|r| r.is_entry(&root.join(entry)))
 +}
 +pub(crate) fn is_artifact(source: &str) -> bool {
 +    runtime().is_some_and(|r| source.starts_with(r.descriptor().artifact_prefix))
@@ -553,7 +580,7 @@ index 0000000..f0c30e4
 +    Ok(runtime.compile(source)?)
 +}
 +pub(crate) fn bundle(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
-+    let source = std::fs::read_to_string(root.join(entry))?;
++    let source = runtime().ok_or_else(|| anyhow::anyhow!("native runtime is not registered"))?.bundle(root, Path::new(entry))?;
 +    compile(&source)?;
 +    Ok(format!(
 +        "{}{}",
@@ -1613,7 +1640,7 @@ index 0000000..645d5dc
 +    Ok(body)
 +}
 diff --git a/crates/celld/protocol.rs b/crates/celld/protocol.rs
-index 1462c3d..cd91c00 100644
+index 1462c3d..08855e1 100644
 --- a/crates/celld/protocol.rs
 +++ b/crates/celld/protocol.rs
 @@ -291,9 +291,16 @@ fn valid_binding_name(name: &str) -> bool {
@@ -1624,7 +1651,7 @@ index 1462c3d..cd91c00 100644
 +    SUPPORTED_DEPLOYMENT_FEATURES
 +        .iter()
 +        .copied()
-+        .chain(crate::native::runtime().map(|r| r.descriptor().required_feature))
++        .chain(crate::native::runtime().into_iter().flat_map(|r| r.supported_features()))
 +}
 +
  pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {

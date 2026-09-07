@@ -4,7 +4,7 @@ Write Python handlers and durable objects on [celld](https://github.com/denoland
 with [Monty](https://github.com/pydantic/monty) executing entirely in Rust.
 
 Use the supplied binary, or import the `pycelld` Rust crate to build a host with
-your own Monty functions and classes. The crate includes the patched celld host;
+your own Monty functions and classes at custom Python import paths. The crate includes the patched celld host;
 applications need no patch commands or separate celld fork. Three maintained
 patches reproduce the included host sources from celld 0.4.1.
 
@@ -67,12 +67,15 @@ Returns map to HTTP responses, and exceptions become structured errors. Durable
 calls preserve supported Python values, including dataclasses. Iterators and
 streaming are deferred.
 
+Workers can also export a package through its `__init__.py`; set `main` to the
+package directory.
+
 See the [Python API](docs/python.md) and [complete example](examples/monty/worker.py).
 
 ## Rust integration
 
 - [`pycelld`](src/lib.rs) includes the patched host, Monty, and the runtime API.
-  Configure `Monty::new().with_function(...).with_python(...)`, then call
+  Mount extensions with `Monty::new().with_module(PythonModule::new("acme.api")...)`, then call
   `pycelld::run(runtime)` from your binary. See [extending Monty](docs/extensions.md)
   and the [custom host example](examples/extended-host/main.rs).
 - [`celld-runtime`](crates/runtime-api/src/lib.rs) defines compilation, suspended

@@ -1,7 +1,7 @@
 //! The celld integration uses only the public native runtime contract.
 use crate::{
     Failure, Session,
-    exports::{Module, durable_classes},
+    exports::{Module, prepare},
     value,
 };
 use api::{HostCall, HostReply, Response, Step};
@@ -23,34 +23,75 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-native-v1",
+    required_feature: "monty-modules-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
         &DESCRIPTOR
     }
+    fn supported_features(&self) -> Vec<&'static str> {
+        vec!["monty-native-v1", "monty-modules-v1"]
+    }
     fn types(&self) -> &str {
-        if self.extensions.types.is_empty() {
-            crate::TYPES
-        } else {
-            &self.extensions.types
+        &self.extensions.modules["celld"].types
+    }
+    fn type_files(&self) -> std::collections::BTreeMap<String, String> {
+        let mut files = std::collections::BTreeMap::new();
+        for (name, module) in &self.extensions.modules {
+            let mut parts = name.split('.').collect::<Vec<_>>();
+            let leaf = parts.pop().unwrap();
+            let mut directory = String::new();
+            for part in parts {
+                directory.push_str(part);
+                directory.push('/');
+                files
+                    .entry(format!("{directory}__init__.pyi"))
+                    .or_insert_with(String::new);
+            }
+            let has_children = self
+                .extensions
+                .modules
+                .keys()
+                .any(|n| n.starts_with(&format!("{name}.")));
+            let path = if has_children {
+                format!("{directory}{leaf}/__init__.pyi")
+            } else {
+                format!("{directory}{leaf}.pyi")
+            };
+            files.insert(path, module.types.clone());
         }
+        files
+    }
+    fn is_entry(&self, path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|e| e == "py")
+            || (path.is_dir() && path.join("__init__.py").is_file())
+    }
+    fn bundle(&self, root: &std::path::Path, entry: &std::path::Path) -> api::Result<String> {
+        Ok(crate::package::Package::read(root, entry, &self.extensions.sources())?.encode()?)
     }
     fn compile(&self, source: &str) -> api::Result<Box<dyn api::Program>> {
-        if source.len() > 256 * 1024 {
-            return Err("Monty source exceeds 256 KiB".into());
-        }
-        let classes = durable_classes(source)?;
+        let compiled = prepare(source, &self.extensions)?;
         Ok(Box::new(Program {
-            http: Module::compile_extended(source, None, self.extensions.clone())?,
-            objects: classes
+            http: Module::compile_graph(
+                &compiled.graph,
+                &compiled.entry,
+                None,
+                self.extensions.clone(),
+            )?,
+            objects: compiled
+                .classes
                 .iter()
-                .map(|name| {
-                    Module::compile_extended(source, Some(name), self.extensions.clone())
-                        .map(|module| (name.clone(), module))
+                .map(|(identity, module, class)| {
+                    Module::compile_graph(
+                        &compiled.graph,
+                        &compiled.entry,
+                        Some((module, class)),
+                        self.extensions.clone(),
+                    )
+                    .map(|m| (identity.clone(), m))
                 })
                 .collect::<Result<_, _>>()?,
-            classes,
+            classes: compiled.classes.into_iter().map(|(id, _, _)| id).collect(),
         }))
     }
 }

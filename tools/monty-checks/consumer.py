@@ -18,6 +18,7 @@ import uuid
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--path", action="store_true")
+parser.add_argument("--profile", choices=["dev", "lab"], default="lab")
 args = parser.parse_args()
 repo = Path(__file__).resolve().parents[2]
 cargo = shutil.which("cargo") or str(Path.home() / ".cargo/bin/cargo")
@@ -47,16 +48,18 @@ path = "app/main.rs"
 ''')
     shutil.copyfile(repo / "Cargo.lock", root / "Cargo.lock")
     target = repo / "target"
-    subprocess.run([cargo, "build", "--profile", "lab", "--target-dir", str(target)], cwd=root, check=True)
-    binary = target / "lab/pycelld-consumer"
+    subprocess.run([cargo, "build", "--profile", args.profile, "--target-dir", str(target)], cwd=root, check=True)
+    binary = target / ("debug" if args.profile == "dev" else "lab") / "pycelld-consumer"
     types = root / "types"
     types.mkdir()
-    types.joinpath("celld.pyi").write_bytes(subprocess.check_output([binary, "types"]))
+    subprocess.run([binary, "types", types], check=True)
+    assert types.joinpath("acme/native.pyi").is_file()
+    assert types.joinpath("acme/greeters.pyi").is_file()
     env = dict(os.environ, MYPYPATH=str(types))
-    subprocess.run(["python", "-m", "mypy", "--strict", str(project / "worker.py"), str(project / "helpers.py")], env=env, cwd=root, check=True)
+    subprocess.run(["python", "-m", "mypy", "--strict", str(project / "worker"), str(project / "helpers.py")], env=env, cwd=root, check=True)
     # A negative type check proves the extension declarations are being used.
     wrong = root / "wrong.py"
-    wrong.write_text("from celld import shout\nshout(123)\n")
+    wrong.write_text("from acme.native import shout\nshout(123)\n")
     check = subprocess.run(["python", "-m", "mypy", "--strict", str(wrong)], env=env, cwd=root, capture_output=True, text=True)
     assert check.returncode == 1 and "arg-type" in check.stdout, check.stdout + check.stderr
 
@@ -70,9 +73,14 @@ path = "app/main.rs"
 
     def call(name, values):
         request = Request(url + "/" + name, data=json.dumps(values).encode(), headers={"content-type": "application/json"})
-        with urlopen(request, timeout=30) as response:
-            data = response.read()
-            return json.loads(data) if "application/json" in response.headers.get("content-type", "") else data.decode()
+        try:
+            with urlopen(request, timeout=30) as response:
+                data = response.read()
+                return json.loads(data) if "application/json" in response.headers.get("content-type", "") else data.decode()
+        except HTTPError as error:
+            if error.code != 404:
+                raise AssertionError(f"{name}: {error.code}: {error.read().decode()}") from error
+            raise
 
     with log_path.open("w") as log:
         process = subprocess.Popen([binary, "dev", project, "--port", str(port), "--logs"], env=env, stdout=log, stderr=log)

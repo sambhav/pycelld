@@ -1,10 +1,10 @@
 # Python workers
 
-Point `main` at a Python file. Monty is built into celld; no Python installation,
+Point `main` at a Python file or package directory containing `__init__.py`. Monty is built into celld; no Python installation,
 SDK, bundler or runtime setting is needed.
 
 Custom hosts can [add typed Python functions, classes, and Rust callbacks](extensions.md)
-to the `celld` import using the `pycelld` Rust crate.
+at custom import paths using the `pycelld` Rust crate.
 
 `wrangler.jsonc`:
 
@@ -35,7 +35,50 @@ Every public function declared in the entry file becomes `POST /function`.
 A JSON object supplies named arguments; defaults and keyword-only parameters
 work normally. Declare `ctx: Context` to receive host capabilities. Callers
 cannot supply `ctx`. Empty bodies mean `{}`. A literal `__all__` can restrict
-exports; imported functions and private helpers are never handlers.
+exports. Functions re-exported from project modules are supported; imported host
+functions and private names are never handlers.
+
+## Packages
+
+A worker can export a whole package:
+
+```json
+{"name": "shop", "main": "shop"}
+```
+
+`shop/__init__.py` defines its public API:
+
+```python
+from .handlers import hello, increment
+
+__all__ = ["hello", "increment"]
+```
+
+Put implementations in `shop/handlers.py`, durable classes in `shop/objects.py`,
+and shared value classes or helpers in other submodules. Normal absolute,
+relative, and aliased imports work. The functions above become `POST /hello`
+and `POST /increment`; submodule paths are not URL prefixes. Without `__all__`,
+public functions defined or re-exported by the entry module become handlers.
+`__all__` must be one literal list or tuple of public names.
+
+A directory entry includes every `.py` file beneath it; `main` may also name
+its `__init__.py`. A file entry includes its transitive local imports and parent
+package initializers. Imported source must stay inside the project. Changes to
+included source change the deployment version. Data files are not bundled;
+source symlinks within package directories and ambiguous module/package names
+are rejected.
+
+Modules have isolated globals and initialize lazily, once per invocation.
+Circular imports work when initialization does not read a name before the other
+module defines it. Module namespaces and function values stay inside Monty. Python parsing and binding resolution happen in Rust; executing an import
+never reads the host filesystem or calls JavaScript. No Monty fork is required.
+
+This supports source packages within Monty's Python subset, not installation of
+wheels or CPython extensions. Static named imports and `from __future__ import
+annotations` are supported. Wildcard imports, dynamic module discovery
+(`importlib`, `sys.modules`), module/global assignment expressions (`:=`), and
+module/global exception aliases (`except ... as name`) are unsupported. Catch
+exceptions in a function when an alias is needed.
 
 ## Responses
 
@@ -91,7 +134,11 @@ Ordinary helper classes and dataclasses remain local.
 
 Use a nonempty string ID, up to 1,024 characters. Routing happens before the
 constructor runs, so compose IDs at the call site: `Counter(f"{tenant}/{cart}", ctx)`.
-The class and ID identify persistent storage. IDs are not authorization boundaries.
+The class and ID identify persistent storage. Package classes use the defining
+module path, such as `shop.objects.Counter`; moving that definition changes its
+storage identity. Re-exporting it under another name does not. File-entry classes
+retain their existing bare identity, such as `Counter`, for compatibility.
+IDs are not authorization boundaries.
 
 Each method is a serialized turn, including awaited I/O. Call async methods
 with `await`; call the current object's methods through `self`. Avoid cyclic
@@ -150,9 +197,12 @@ and durability mechanisms. Python workers allocate no V8 isolate; the binary
 still includes V8 for TypeScript. See the [benchmark](../tools/monty-checks/bench/README.md)
 and [test instructions](testing.md).
 
-Limits: 256 KiB of source, 1 MiB per request/result/host reply, 100 ms of
+Limits: 256 KiB per source module, 256 worker modules and 1 MiB total worker
+source per deployment, 32 package directory levels, 1 MiB per request/result/host
+reply, 100 ms of
 interpreter execution, 10,000 host operations, 256 live invocations per worker
 slot, 16 nested transactions, and a 30-second wall-clock deadline per durable turn.
 
-Monty implements a reduced Python subset. Third-party packages, `yield`, async
-iterators, streaming, WebSockets, queues and workflows are unsupported.
+Monty implements a reduced Python subset. External package installation, native
+Python extensions, `yield`, async iterators, streaming, WebSockets, queues and
+workflows are unsupported.

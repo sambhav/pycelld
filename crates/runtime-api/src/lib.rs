@@ -2,6 +2,7 @@
 //! implementations own compilation, language values and suspended executions.
 //! No interpreter, executor, database, or JavaScript types cross this boundary.
 use serde_json::Value;
+use std::{collections::BTreeMap, path::Path};
 
 pub type Result<T> = std::result::Result<T, Failure>;
 
@@ -15,7 +16,22 @@ pub struct Descriptor {
 pub trait Runtime: Send + Sync {
     fn descriptor(&self) -> &Descriptor;
     fn compile(&self, source: &str) -> Result<Box<dyn Program>>;
+    fn supported_features(&self) -> Vec<&'static str> {
+        vec![self.descriptor().required_feature]
+    }
     fn types(&self) -> &str;
+    /// Files emitted by `celld types DIRECTORY`, relative to that directory.
+    fn type_files(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([("celld.pyi".into(), self.types().into())])
+    }
+    /// Deployment entry detection and bundling belong to the language runtime.
+    fn is_entry(&self, path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|e| e == self.descriptor().extension)
+    }
+    fn bundle(&self, root: &Path, entry: &Path) -> Result<String> {
+        std::fs::read_to_string(root.join(entry)).map_err(|e| e.to_string().into())
+    }
 }
 
 /// Cached compilation is cloned once per worker slot. Programs and executions

@@ -14,20 +14,20 @@ sources directly. Your application does not run `xtask` or repeat `[patch]`
 sections. Cargo only reads patch settings from the consuming workspace's root;
 see the [Cargo reference](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#the-patch-section).
 
-## Native Rust functions
+## Import paths and native Rust functions
 
 ```rust
-use pycelld::{ExcType, Monty, PythonError, PythonValue};
+use pycelld::{ExcType, Monty, PythonError, PythonModule, PythonValue};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = Monty::new().with_function(
+    let text = PythonModule::new("acme.text").with_function(
         "def uppercase(text: str) -> str: ...",
         |args| match args.as_slice() {
             [PythonValue::String(text)] => Ok(PythonValue::String(text.to_uppercase())),
             _ => Err(PythonError::new(ExcType::TypeError, Some("expected text".into()))),
         },
     )?;
-    pycelld::run(runtime)?;
+    pycelld::run(Monty::new().with_module(text)?)?;
     Ok(())
 }
 ```
@@ -35,11 +35,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Workers can then use:
 
 ```python
-from celld import uppercase
+from acme.text import uppercase
 
 def hello(name: str = "world") -> str:
     return uppercase("Hello, " + name)
 ```
+
+Each `PythonModule` has its own namespace. Dotted paths create parent packages;
+`import acme.text`, `import acme.text as text`, and
+`from acme.text import uppercase as upper` all work. Modules can import each
+other with absolute or relative paths, regardless of registration order.
+Different modules may export functions or classes with the same name.
+Duplicate module paths and replacements of Monty's standard modules are rejected.
+
+The existing `Monty::with_function` and `Monty::with_python` methods remain
+shortcuts for additions to `celld`. Use `PythonModule` for your own paths,
+including `celld.my_extension` when appropriate.
 
 The signature must be a synchronous Python `def` with annotations on every
 parameter and the return value, and an ellipsis body. Defaults, positional-only
@@ -59,18 +70,20 @@ run concurrently.
 Register Python source alongside its public `.pyi` declarations:
 
 ```rust
-let runtime = runtime.with_python(
+let helpers = PythonModule::new("acme.greeters").with_python(
     include_str!("helpers.py"),
     include_str!("helpers.pyi"),
 )?;
+let runtime = runtime.with_module(helpers)?;
 ```
 
 Both files must declare the same public function and class names. The source
 can contain imports, private helpers, ordinary functions, async functions, and
 classes supported by Monty. Extensions can import built-in `celld` types and
-previously registered extensions. Duplicate public names and replacements of
-built-in context types are rejected. These files share the worker's Python
-namespace, so use distinct helper names across extensions.
+other registered modules. Multiple additions to one module share its namespace;
+private helper names should be distinct within that module. Different modules
+have isolated globals. Every imported module initializes once per invocation;
+unimported modules do not run.
 
 Pass `ctx: Context` explicitly to helper classes and store it in `self._ctx`.
 Their methods can call registered Rust functions and use normal typed context
@@ -79,8 +92,9 @@ capabilities, including async fetch/sleep and durable storage. The
 Python `Greeter` and `Greeting` classes, then uses them from a handler and a
 durable object.
 
-Only public functions declared in the worker entry file become HTTP endpoints.
-Injected classes are ordinary helpers or value classes; worker durable classes
+The worker's entry module or package defines its HTTP endpoints, including
+re-exports of functions from its own submodules. Imported host functions never
+become endpoints. Injected classes are ordinary helpers or value classes; worker durable classes
 still use the [durable constructor contract](python.md). Returned values and
 raised exceptions follow the existing response rules. Streaming remains deferred.
 
@@ -97,21 +111,28 @@ Run the included example:
 
 ```sh
 cargo build --locked --profile lab --example extended-host
-target/lab/examples/extended-host types > celld.pyi
-MYPYPATH=. mypy --strict examples/extended-host/worker.py examples/extended-host/helpers.py
+target/lab/examples/extended-host types target/python-types
+MYPYPATH=target/python-types mypy --strict examples/extended-host/worker examples/extended-host/helpers.py
 target/lab/examples/extended-host dev examples/extended-host
 ```
 
-`types` includes the complete built-in context declarations, native function
-signatures, and Python extension stubs. Keep the stubs beside their implementation
-and type check both helpers and workers against the generated file.
+`types DIRECTORY` writes the complete import tree: `celld.pyi`,
+`acme/__init__.pyi`, `acme/native.pyi`, and `acme/greeters.pyi` in this example.
+Modules with children use `__init__.pyi`. Set `MYPYPATH` to that directory and
+configure your editor's stub path similarly. `types` without a directory keeps
+its stdout behavior for hosts that only expose `celld`; hosts with multiple
+modules require a directory. Rust embedders can use `Runtime::type_files()`.
+Keep helper `.pyi` declarations beside their implementation and type check both
+helpers and workers against the generated tree.
 
 Rust callbacks run synchronously on a worker thread and cannot be preempted by
 Monty's interpreter limits. Keep them bounded and nonblocking. Use Python helpers
 with `ctx` for I/O so celld retains cancellation, storage scope, and durability
 gates. Callback argument/result payloads are limited to 1 MiB and calls share the
 existing 10,000-call invocation budget. Extension source and declarations each
-have a 256 KiB budget in addition to the worker's source budget.
+have a 256 KiB budget per module. The host supports up to 256 registered modules
+and 2 MiB of combined extension source and declarations. Worker package budgets
+are separate; see [Python packages and import limits](python.md#packages).
 
 The facade enables upstream's jemalloc allocator and memory-pressure accounting
 by default. Applications supplying their own global allocator can use

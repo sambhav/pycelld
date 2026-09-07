@@ -17,15 +17,20 @@ SQLite activation, and reproducible patch preparation.
 
 Extension regressions cover keyword/default binding, native binary values,
 catchable Rust errors, registration validation, budgets, and helper classes in
-stateless and durable executions. Maintainer commands also verify that every
+stateless and durable executions. Module tests cover aliases, same-name exports,
+relative and circular imports, isolated globals and closures, lazy initialization,
+package source discovery, path boundaries, and qualified durable identities. Maintainer commands also verify that every
 included host source matches the pinned upstream plus the patch series.
 
 The consumer check builds a separate application using a Git dependency on the
 current commit, with no patch or preparation step in that application. It checks
 generated declarations with strict mypy (including a negative type test), then
 exercises custom Rust functions and Python classes over HTTP, async context
-calls, dataclass RPC, and durable storage. Use `consumer.py --path` to check
+calls, dataclass RPC, and durable storage from a worker package importing two
+custom extension modules. Use `consumer.py --path` to check
 uncommitted local changes before committing; CI always checks the Git import.
+For a faster local build, add `--profile dev` to the consumer command and
+`cargo xtask test`; CI uses the optimized `lab` profile.
 
 Native pool regressions exercise concurrent cell placement at densities 1, 2,
 and 32, packing after eviction, suspension across retirement, reclaiming drained

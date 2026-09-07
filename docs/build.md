@@ -61,7 +61,8 @@ upstream's new embedded facets are not exposed to Python yet.
 
 The API follows the current bounded execution model:
 
-1. `Runtime` describes and compiles an artifact and supplies editor types.
+1. `Runtime` recognizes entry paths, bundles source, compiles an artifact, and
+   supplies editor type files. Default hooks preserve single-file runtimes.
 2. `Program` caches compilation, forks once per worker slot, and starts calls.
 3. `Execution::resume` consumes a typed host reply. It returns either a completed
    response or the next typed `HostCall`.
@@ -72,6 +73,11 @@ Dropping an execution cancels its interpreter state; celld independently owns
 I/O cancellation, transaction rollback, authority, and gate cleanup. Storage
 values are JSON; fetch and durable-call bodies cross the interface as byte
 buffers. Serialization of remote Python values belongs to Monty.
+
+Monty bundles package sources into a deterministic artifact. New deployments
+require `monty-modules-v1`; the runtime also advertises `monty-native-v1` and
+continues loading older single-file artifacts. Hosts without package support
+reject new deployments during feature negotiation.
 
 The host provides a scoped context internally. Runtime code cannot select a
 storage scope, access a SQLite connection, or bypass an output gate. Python's

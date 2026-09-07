@@ -216,3 +216,203 @@ fn native_callbacks_preserve_dataclass_fields() {
         json!({"name":"test", "size":2})
     );
 }
+
+fn package(entry: &str, sources: &[(&str, bool, &str)]) -> String {
+    let modules: serde_json::Map<String, serde_json::Value> = sources
+        .iter()
+        .map(|(name, package, source)| ((*name).into(), json!({"source":source,"package":package})))
+        .collect();
+    format!(
+        "# celld:python-package-v1\n{}",
+        json!({"entry":entry,"modules":modules})
+    )
+}
+
+#[test]
+fn extension_modules_have_independent_names_aliases_and_parent_packages() {
+    use celld_monty::PythonModule;
+    let runtime = Monty::new()
+        .with_module(
+            PythonModule::new("acme.text")
+                .with_function("def format(value: str) -> str: ...", |args| {
+                    let [PythonValue::String(value)] = args.as_slice() else {
+                        panic!("expected string")
+                    };
+                    Ok(PythonValue::String(value.to_uppercase()))
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .with_module(
+            PythonModule::new("acme.other")
+                .with_function("def format(value: str) -> str: ...", |args| {
+                    Ok(args[0].clone())
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let program = runtime.compile("import acme.text\nimport acme.text as text\nfrom acme.other import format as other\nfrom celld import Context as Ctx\ndef run(ctx: Ctx):\n    return [acme.text.format('one'), text.format('two'), other('three'), ctx.env]").unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("not a response")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+        json!(["ONE", "TWO", "three", {}])
+    );
+    let types = runtime.type_files();
+    assert!(types["acme/text.pyi"].contains("def format"));
+    assert!(types.contains_key("acme/__init__.pyi"));
+    assert!(types["celld.pyi"].contains("class Context:"));
+    assert!(!runtime.types().contains("def format"));
+    assert!(runtime.with_module(PythonModule::new("acme.text")).is_err());
+    assert!(
+        Monty::new()
+            .with_module(PythonModule::new("../../bad"))
+            .is_err()
+    );
+    assert!(Monty::new().with_module(PythonModule::new("json")).is_err());
+}
+
+#[test]
+fn package_imports_preserve_globals_closures_and_lazy_module_initialization() {
+    let source = package(
+        "app",
+        &[
+            (
+                "app",
+                true,
+                "from .left import compute as run\n__all__ = ['run']",
+            ),
+            (
+                "app.left",
+                false,
+                "from . import right\ncount = 1\ndef compute():\n    global count\n    count += 1\n    right.count = 20\n    values = [count for count in range(3)]\n    def local(count): return count + 1\n    def outer():\n        count = 5\n        def inner():\n            nonlocal count\n            count += 1\n            return count\n        return inner()\n    return [count, right.read(), values, local(10), outer(), (lambda count: count * 2)(7)]",
+            ),
+            (
+                "app.right",
+                false,
+                "from . import left\ncount = 100\ndef read(): return count",
+            ),
+            ("app.unused", false, "raise ValueError('must remain lazy')"),
+        ],
+    );
+    let program = Monty::new().compile(&source).unwrap();
+    for _ in 0..2 {
+        let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+            panic!("not a response")
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+            json!([2, 20, [0, 1, 2], 11, 6, 14])
+        );
+    }
+    let mut hidden = invocation();
+    hidden.request.url = "http://test/compute".into();
+    let (_, Step::Return(response)) = program.start(hidden).unwrap() else {
+        panic!("not a response")
+    };
+    assert_eq!(response.status, 404);
+}
+
+#[test]
+fn package_durable_classes_keep_qualified_identity_and_typed_context() {
+    let source = package(
+        "shop",
+        &[
+            ("shop", true, "from .handlers import run\n__all__ = ['run']"),
+            (
+                "shop.handlers",
+                false,
+                "from celld import Context\nfrom .objects import Counter\ndef run(ctx: Context): return Counter('one', ctx).get()",
+            ),
+            (
+                "shop.objects",
+                false,
+                "from celld import Context\nfrom .value import Value\nclass Counter:\n    def __init__(self, id: str, ctx: Context):\n        self.id = id\n        self._ctx = ctx\n    def get(self): return Value(self.id, self._ctx.env['GREETING'])",
+            ),
+            (
+                "shop.value",
+                false,
+                "from dataclasses import dataclass\n@dataclass\nclass Value:\n    id: str\n    greeting: str",
+            ),
+        ],
+    );
+    let program = Monty::new().compile(&source).unwrap();
+    assert_eq!(program.classes(), ["shop.objects.Counter"]);
+    let mut call = invocation();
+    call.env = json!({"GREETING":"hello"});
+    let (
+        mut execution,
+        Step::Call(HostCall::CallObject {
+            object,
+            method,
+            body,
+        }),
+    ) = program.start(call).unwrap()
+    else {
+        panic!("expected object call")
+    };
+    assert_eq!(object.class, "shop.objects.Counter");
+    let mut call = invocation();
+    call.env = json!({"GREETING":"hello"});
+    call.object = Some(object);
+    call.request.url = format!("http://test/{method}");
+    call.request.body = body;
+    let (_, Step::Return(response)) = program.start(call).unwrap() else {
+        panic!("expected object return")
+    };
+    let Step::Return(response) = execution.resume(HostReply::Object(response)).unwrap() else {
+        panic!("expected HTTP return")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+        json!({"id":"one", "greeting":"hello"})
+    );
+}
+
+#[test]
+fn modules_registered_in_any_order_support_relative_class_imports() {
+    use celld_monty::PythonModule;
+    let runtime = Monty::new()
+        .with_module(PythonModule::new("acme.labels").with_python(
+            "from .native import prefix\nfrom dataclasses import dataclass\n@dataclass\nclass Label:\n    text: str\ndef label(value: str) -> Label: return Label(prefix(value))",
+            "from dataclasses import dataclass\n@dataclass\nclass Label:\n    text: str\ndef label(value: str) -> Label: ...",
+        ).unwrap()).unwrap()
+        .with_module(PythonModule::new("acme.native").with_function("def prefix(value: str) -> str: ...", |args| {
+            let [PythonValue::String(value)] = args.as_slice() else { panic!("expected string") };
+            Ok(PythonValue::String(format!("hello {value}")))
+        }).unwrap()).unwrap();
+    let program = runtime.compile("def run():\n    from acme.labels import label as make_label\n    return make_label('world')").unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("not a response")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+        json!({"text":"hello world"})
+    );
+}
+
+#[test]
+fn qualified_imports_preserve_dataclasses_named_like_builtin_response() {
+    let source = package(
+        "app",
+        &[
+            (
+                "app",
+                true,
+                "from __future__ import annotations\nfrom .models import Response as Payload\ndef run() -> Payload:\n    return Payload(42)",
+            ),
+            (
+                "app.models",
+                false,
+                "from dataclasses import dataclass\n@dataclass\nclass Response:\n    value: int",
+            ),
+        ],
+    );
+    let program = Monty::new().compile(&source).unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("expected response")
+    };
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, br#"{"value":42}"#);
+}

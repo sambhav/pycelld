@@ -136,7 +136,7 @@ pub fn response(value: &M) -> Result<HttpResponse, String> {
             v.clone(),
             false,
         ),
-        M::ClassInstance(v) if v.class_type.name == "Response" => {
+        M::ClassInstance(v) if v.class_type.name == "Response" && !v.class_type.is_dataclass => {
             let fields = v
                 .attrs
                 .iter()

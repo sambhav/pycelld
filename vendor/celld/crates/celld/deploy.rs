@@ -451,7 +451,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let is_native = project
         .entry
         .as_deref()
-        .is_some_and(crate::native::is_entry);
+        .is_some_and(|entry| crate::native::is_entry(&root, entry));
     let started = Instant::now();
     let built_assets = project.assets.as_ref().map(build_assets).transpose()?;
     let bundle = project
@@ -1046,8 +1046,10 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         let entry = root.join(main);
         let metadata = std::fs::symlink_metadata(&entry)
             .with_context(|| format!("inspect entry point {}", entry.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("entry point {} is not a regular file", entry.display());
+        if !metadata.file_type().is_file()
+            && !(metadata.file_type().is_dir() && crate::native::is_entry(root, main))
+        {
+            bail!("entry point {} is not a regular file or supported runtime package", entry.display());
         }
     }
     let no_bundle = match object.get("no_bundle") {
@@ -1576,8 +1578,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         }
     }
     // Class identity and SQLite registration come from Native source.
-    if main.as_deref().is_some_and(crate::native::is_entry) {
-        let source = std::fs::read_to_string(root.join(main.as_deref().unwrap()))?;
+    if main.as_deref().is_some_and(|entry| crate::native::is_entry(&root, entry)) {
+        let source = crate::native::runtime().unwrap().bundle(root, Path::new(main.as_deref().unwrap()))?;
         for class in crate::native::compile(&source)?.classes().iter().cloned() {
             if do_classes.contains(&class) || sqlite_classes.contains(&class) {
                 bail!(

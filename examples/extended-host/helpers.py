@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from celld import Context, shout
+from celld import Context
+from acme.native import shout
 
 
 @dataclass

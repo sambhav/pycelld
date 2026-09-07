@@ -295,7 +295,7 @@ pub fn supported_deployment_features() -> impl Iterator<Item = &'static str> {
     SUPPORTED_DEPLOYMENT_FEATURES
         .iter()
         .copied()
-        .chain(crate::native::runtime().map(|r| r.descriptor().required_feature))
+        .chain(crate::native::runtime().into_iter().flat_map(|r| r.supported_features()))
 }
 
 pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {

@@ -1,9 +1,11 @@
 //! Native Python compilation, values, capabilities and suspended executions.
 mod exports;
 mod extensions;
+mod modules;
+mod package;
 mod runtime;
 mod value;
-pub use extensions::PythonResult;
+pub use extensions::{PythonModule, PythonResult};
 pub use monty_types::{ExcType, MontyException as PythonError, MontyObject as PythonValue};
 pub use runtime::Monty;
 

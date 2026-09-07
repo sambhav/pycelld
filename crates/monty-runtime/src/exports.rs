@@ -1,13 +1,8 @@
 use monty::{MontyRun, RunProgress};
 use monty_types::{CompileOptions, MontyObject, PrintWriter, ResourceLimits, ResourceTracker};
-use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{Expr, Stmt};
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 enum Kind {
@@ -157,132 +152,149 @@ impl Function {
 pub struct Module {
     functions: BTreeMap<String, Function>,
 }
+pub(crate) struct Compilation {
+    pub graph: crate::modules::Graph,
+    pub entry: String,
+    // Stable durable identity, defining module, class name.
+    pub classes: Vec<(String, String, String)>,
+}
+pub(crate) fn prepare(
+    source: &str,
+    extensions: &crate::extensions::Extensions,
+) -> Result<Compilation, String> {
+    let package = crate::package::Package::parse(source)?;
+    let mut modules = extensions.sources();
+    let mut classes = Vec::new();
+    for (name, mut module) in package.modules {
+        if modules.contains_key(&name) {
+            return Err(format!("worker module conflicts with host module: {name}"));
+        }
+        let names = durable_classes(&module.source)?;
+        let mut identities = BTreeMap::new();
+        for class in names {
+            let id = if package.single && name == package.entry {
+                class.clone()
+            } else {
+                format!("{name}.{class}")
+            };
+            classes.push((id.clone(), name.clone(), class.clone()));
+            identities.insert(class, id);
+        }
+        module
+            .source
+            .push_str(&durable_proxies(&module.source, &identities)?);
+        modules.insert(name, module);
+    }
+    let graph = crate::modules::Graph::new(modules)?;
+    // Validate all explicit package interfaces before any worker is started.
+    for (name, module) in &graph.modules {
+        if module.worker {
+            crate::modules::exports(name, module)?;
+        }
+    }
+    Ok(Compilation {
+        graph,
+        entry: package.entry,
+        classes,
+    })
+}
 impl Module {
-    /// Discovers only direct, public function declarations in the entry module.
-    /// A literal __all__ optionally restricts that set; imports/classes/aliases are excluded.
     #[cfg(test)]
     pub fn compile(source: &str) -> Result<Self, String> {
-        Self::compile_extended(source, None, Arc::default())
+        let extensions = Arc::new(crate::extensions::Extensions::default());
+        let compiled = prepare(source, &extensions)?;
+        Self::compile_graph(&compiled.graph, &compiled.entry, None, extensions)
     }
     #[cfg(test)]
     pub fn compile_class(source: &str, class: &str) -> Result<Self, String> {
-        Self::compile_extended(source, Some(class), Arc::default())
+        let extensions = Arc::new(crate::extensions::Extensions::default());
+        let compiled = prepare(source, &extensions)?;
+        Self::compile_graph(
+            &compiled.graph,
+            &compiled.entry,
+            Some((&compiled.entry, class)),
+            extensions,
+        )
     }
-    pub(crate) fn compile_extended(
-        source: &str,
-        class: Option<&str>,
+    pub(crate) fn compile_graph(
+        graph: &crate::modules::Graph,
+        entry: &str,
+        class: Option<(&str, &str)>,
         extensions: Arc<crate::extensions::Extensions>,
     ) -> Result<Self, String> {
-        let code = celld_imports(source, &extensions.names)?;
-        let source = code.as_str();
-        let parsed = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
-        let mut definitions = BTreeMap::new();
-        let mut explicit = None;
-        let class_def = if let Some(name) = class {
-            Some(
-                parsed
-                    .syntax()
-                    .body
-                    .iter()
-                    .find_map(|stmt| match stmt {
-                        Stmt::ClassDef(c) if c.name.as_str() == name => Some(c),
-                        _ => None,
-                    })
-                    .ok_or_else(|| format!("unknown Python class {name}"))?,
-            )
-        } else {
-            None
-        };
-        let statements = class_def.map_or(&parsed.syntax().body, |c| &c.body);
-        for stmt in statements {
-            match stmt {
-                Stmt::FunctionDef(f) => {
-                    if definitions.insert(f.name.to_string(), f).is_some() {
-                        return Err(format!("duplicate function {}", f.name));
-                    }
-                }
-                Stmt::Assign(a)
-                    if a.targets
-                        .iter()
-                        .any(|t| matches!(t,Expr::Name(n) if n.id.as_str()=="__all__")) =>
-                {
-                    if explicit.is_some() || a.targets.len() != 1 {
-                        return Err("__all__ must be assigned once".into());
-                    }
-                    let values = match a.value.as_ref() {
-                        Expr::List(l) => &l.elts,
-                        Expr::Tuple(t) => &t.elts,
-                        _ => return Err("__all__ must be a literal list or tuple".into()),
-                    };
-                    let mut names = BTreeSet::new();
-                    for v in values {
-                        let Expr::StringLiteral(s) = v else {
-                            return Err("__all__ entries must be literal names".into());
-                        };
-                        let name = s.value.to_string();
-                        if !names.insert(name) {
-                            return Err("duplicate __all__ entry".into());
-                        }
-                    }
-                    explicit = Some(names);
-                }
-                _ => (),
-            }
-        }
-        // Dynamic export changes must fail rather than silently expose a larger API.
-        struct ExportUses(usize);
-        impl<'a> Visitor<'a> for ExportUses {
-            fn visit_expr(&mut self, expr: &'a Expr) {
-                if matches!(expr, Expr::Name(n) if n.id.as_str()=="__all__") {
-                    self.0 += 1;
-                }
-                visitor::walk_expr(self, expr);
-            }
-        }
-        let mut uses = ExportUses(0);
-        for stmt in statements {
-            uses.visit_stmt(stmt);
-        }
-        if uses.0 != usize::from(explicit.is_some()) {
-            return Err("__all__ must be one plain literal assignment; dynamic or annotated exports are unsupported".into());
-        }
-        let construct_with_context = class.is_some();
-        if let Some(init) = definitions.get("__init__").filter(|_| class.is_some()) {
-            let names: Vec<_> = init
-                .parameters
-                .args
+        let mut selected = Vec::new();
+        if let Some((module, class_name)) = class {
+            let parsed = ruff_python_parser::parse_module(&graph.modules[module].source)
+                .map_err(|e| e.to_string())?;
+            let class_def = parsed
+                .syntax()
+                .body
                 .iter()
-                .chain(init.parameters.kwonlyargs.iter())
-                .map(|p| p.parameter.name.as_str())
+                .find_map(|s| match s {
+                    Stmt::ClassDef(c) if c.name.as_str() == class_name => Some(c),
+                    _ => None,
+                })
+                .ok_or("unknown durable class")?;
+            let definitions: BTreeMap<_, _> = class_def
+                .body
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::FunctionDef(f) => Some((f.name.to_string(), f)),
+                    _ => None,
+                })
                 .collect();
-            if names != ["self", "id", "ctx"]
-                || !init.parameters.kwonlyargs.is_empty()
-                || init.parameters.args.iter().any(|p| p.default.is_some())
-                || !init.parameters.posonlyargs.is_empty()
-                || init.parameters.vararg.is_some()
-                || init.parameters.kwarg.is_some()
-            {
-                return Err("durable constructors must take self, id: str, ctx: Context".into());
+            if let Some(init) = definitions.get("__init__") {
+                let names: Vec<_> = init
+                    .parameters
+                    .args
+                    .iter()
+                    .chain(init.parameters.kwonlyargs.iter())
+                    .map(|p| p.parameter.name.as_str())
+                    .collect();
+                if names != ["self", "id", "ctx"]
+                    || !init.parameters.kwonlyargs.is_empty()
+                    || init.parameters.args.iter().any(|p| p.default.is_some())
+                    || !init.parameters.posonlyargs.is_empty()
+                    || init.parameters.vararg.is_some()
+                    || init.parameters.kwarg.is_some()
+                {
+                    return Err("durable constructors must take self, id: str, ctx: Context".into());
+                }
+            } else {
+                return Err("durable classes need __init__(self, id: str, ctx: Context)".into());
             }
-        } else if class.is_some() {
-            return Err("durable classes need __init__(self, id: str, ctx: Context)".into());
+
+            for (name, f) in definitions {
+                if !name.starts_with('_') {
+                    selected.push((name, module.to_owned(), f.clone()));
+                }
+            }
+        } else {
+            for name in crate::modules::exports(entry, &graph.modules[entry])? {
+                if let Some((module, original)) = graph.resolve(entry, &name)? {
+                    let parsed = ruff_python_parser::parse_module(&graph.modules[&module].source)
+                        .map_err(|e| e.to_string())?;
+                    let functions: Vec<_> = parsed
+                        .syntax()
+                        .body
+                        .iter()
+                        .filter_map(|s| match s {
+                            Stmt::FunctionDef(f) if f.name == original => Some(f),
+                            _ => None,
+                        })
+                        .collect();
+                    if functions.len() > 1 {
+                        return Err(format!("duplicate function {original}"));
+                    }
+                    if let Some(f) = functions.first() {
+                        selected.push((name, module, (*f).clone()));
+                    }
+                }
+            }
         }
-        let proxies = durable_proxies(source)?;
-        let names = explicit.unwrap_or_else(|| {
-            definitions
-                .keys()
-                .filter(|n| !n.starts_with('_'))
-                .cloned()
-                .collect()
-        });
+        let prefix = graph.render(entry)?;
         let mut functions = BTreeMap::new();
-        for name in names {
-            if name.starts_with('_') {
-                return Err("private names cannot be exported".into());
-            }
-            let f = definitions
-                .get(&name)
-                .ok_or_else(|| format!("{name} is not a top-level function"))?;
+        for (name, module, f) in selected {
             if !f.parameters.posonlyargs.is_empty()
                 || f.parameters.vararg.is_some()
                 || f.parameters.kwarg.is_some()
@@ -337,7 +349,11 @@ impl Module {
                     "{name}: method/function decorators are not supported in Monty"
                 ));
             }
-            let target = class.map_or_else(|| name.clone(), |_| format!("_celld_instance.{name}"));
+
+            let target = class.map_or_else(
+                || graph.target(&module, &f.name),
+                |_| format!("_celld_instance.{name}"),
+            );
             let call = format!(
                 "{}{}({}**_celld_args)",
                 if f.is_async { "await " } else { "" },
@@ -348,17 +364,13 @@ impl Module {
                     ""
                 }
             );
-            let construction = class.map_or_else(String::new, |class| format!("_celld_instance = _celld_impl_{class}(id=_celld_context.id, ctx=_celld_context)\n_celld_instance.id = _celld_context.id"));
-            let code = format!(
-                "{}\n{}\n{source}\n{proxies}\n{context_init}\n{construction}\n{call}",
-                include_str!("context.py"),
-                extensions.source,
-                context_init = if context_parameter || construct_with_context {
-                    "_celld_context = Context(_celld_metadata)"
-                } else {
-                    ""
-                }
-            );
+            let construction = class.map_or_else(String::new, |(module, class)| format!("_celld_import({module:?})\n_celld_instance = {}(id=_celld_context.id, ctx=_celld_context)\n_celld_instance.id = _celld_context.id", graph.target(module, &format!("_celld_impl_{class}"))));
+            let context = if context_parameter || class.is_some() {
+                "_celld_context = _celld_import('celld').Context(_celld_metadata)"
+            } else {
+                ""
+            };
+            let code = format!("{prefix}\n{context}\n{construction}\n{call}");
             let runner = MontyRun::new(
                 code,
                 "app.py",
@@ -390,38 +402,6 @@ impl Module {
     }
 }
 
-pub(crate) fn celld_imports(source: &str, names: &BTreeSet<String>) -> Result<String, String> {
-    let parsed = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
-    let mut code = source.as_bytes().to_vec();
-    for statement in &parsed.syntax().body {
-        if let Stmt::ImportFrom(import) = statement {
-            if import.level == 0
-                && import
-                    .module
-                    .as_ref()
-                    .is_some_and(|name| name.as_str() == "celld")
-            {
-                for alias in &import.names {
-                    if alias.asname.is_some()
-                        || !(crate::extensions::BUILTINS.contains(&alias.name.as_str())
-                            || names.contains(alias.name.as_str()))
-                    {
-                        return Err(format!("unknown or aliased celld import: {}", alias.name));
-                    }
-                }
-                for byte in
-                    &mut code[import.range.start().to_usize()..import.range.end().to_usize()]
-                {
-                    if *byte != b'\n' && *byte != b'\r' {
-                        *byte = b' ';
-                    }
-                }
-            }
-        }
-    }
-    String::from_utf8(code).map_err(|e| e.to_string())
-}
-
 /// A durable class is an ordinary class whose constructor declares `ctx`.
 /// Dataclasses and local helper/iterator classes are left untouched.
 pub fn durable_classes(source: &str) -> Result<Vec<String>, String> {
@@ -437,7 +417,7 @@ pub fn durable_classes(source: &str) -> Result<Vec<String>, String> {
     }).collect())
 }
 
-fn durable_proxies(source: &str) -> Result<String, String> {
+fn durable_proxies(source: &str, identities: &BTreeMap<String, String>) -> Result<String, String> {
     let names = durable_classes(source)?;
     let parsed = ruff_python_parser::parse_module(source).map_err(|e| e.to_string())?;
     let mut output = String::new();
@@ -449,6 +429,7 @@ fn durable_proxies(source: &str) -> Result<String, String> {
         if !names.iter().any(|n| n == name) {
             continue;
         }
+        let identity = &identities[name];
         output.push_str(&format!("\n_celld_impl_{name} = {name}\nclass {name}:\n    def __init__(self, id: str, ctx: Context):\n        if not isinstance(id, str) or not id or len(id) > 1024:\n            raise ValueError('object id must contain 1-1024 characters')\n        self.id = id\n"));
         for stmt in &class.body {
             let Stmt::FunctionDef(f) = stmt else { continue };
@@ -485,7 +466,7 @@ fn durable_proxies(source: &str) -> Result<String, String> {
                     values.push(format!("{key:?}: {key}"));
                 }
             }
-            output.push_str(&format!("    {}def {method}({}):\n        return _celld_host('object.call', {name:?}, self.id, {method:?}, {{{}}})\n", if f.is_async { "async " } else { "" }, parameters.join(", "), values.join(", ")));
+            output.push_str(&format!("    {}def {method}({}):\n        return _celld_host('object.call', {identity:?}, self.id, {method:?}, {{{}}})\n", if f.is_async { "async " } else { "" }, parameters.join(", "), values.join(", ")));
         }
     }
     Ok(output)

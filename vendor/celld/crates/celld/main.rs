@@ -3571,15 +3571,33 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Types(arguments) => {
-            if !arguments.is_empty() {
-                anyhow::bail!("usage: celld types > celld.pyi");
+            let runtime = celld::native::runtime()
+                .ok_or_else(|| anyhow::anyhow!("no native runtime is registered"))?;
+            if arguments.is_empty() {
+                if runtime.type_files().len() > 1 {
+                    anyhow::bail!("multiple type modules are registered; use celld types DIRECTORY");
+                }
+                print!("{}", runtime.types());
+            } else if let [directory] = arguments.as_slice() {
+                let root = std::path::Path::new(directory);
+                std::fs::create_dir_all(root)?;
+                let root = root.canonicalize()?;
+                for (name, source) in runtime.type_files() {
+                    let relative = std::path::Path::new(&name);
+                    if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+                        anyhow::bail!("invalid runtime type path: {name}");
+                    }
+                    let path = root.join(relative);
+                    let parent = path.parent().unwrap();
+                    std::fs::create_dir_all(parent)?;
+                    if !parent.canonicalize()?.starts_with(&root) || path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                        anyhow::bail!("runtime type path escapes the output directory: {name}");
+                    }
+                    std::fs::write(path, source)?;
+                }
+            } else {
+                anyhow::bail!("usage: celld types [DIRECTORY]");
             }
-            print!(
-                "{}",
-                celld::native::runtime()
-                    .map(|r| r.types())
-                    .unwrap_or_default()
-            );
             return Ok(());
         }
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,

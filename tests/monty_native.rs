@@ -291,7 +291,7 @@ fn monty_builds_native_python_without_javascript_modules() {
         .manifest
         .required_features
         .iter()
-        .any(|f| f == "monty-native-v1"));
+        .any(|f| f == "monty-modules-v1"));
     assert!(!built
         .modules
         .iter()
@@ -318,4 +318,30 @@ fn monty_builds_native_python_without_javascript_modules() {
     std::fs::write(&config, r#"{"name":"monty","main":"worker.py"}"#).unwrap();
     std::fs::write(&entry, "invalid Python!").unwrap();
     assert!(build(&options(config)).is_err());
+}
+
+#[test]
+fn package_deployments_discover_submodule_classes_and_version_every_source() {
+    register();
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("shop");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("__init__.py"), "from .handlers import run\n__all__ = ['run']").unwrap();
+    std::fs::write(package.join("handlers.py"), "from .objects import Counter\ndef run(ctx, id: str): return Counter(id, ctx).read()").unwrap();
+    std::fs::write(package.join("objects.py"), "from celld import Context\nclass Counter:\n    def __init__(self, id: str, ctx: Context):\n        self.id = id\n        self._ctx = ctx\n    def read(self) -> int: return 42").unwrap();
+    let config = root.path().join("wrangler.json");
+    std::fs::write(&config, r#"{"name":"shop","main":"shop"}"#).unwrap();
+    let built = build(&options(config.clone())).unwrap();
+    assert_eq!(built.manifest.do_classes, ["shop.objects.Counter"]);
+    assert_eq!(built.manifest.sqlite_classes, ["shop.objects.Counter"]);
+    assert_eq!(built.modules.len(), 1);
+    assert!(built.manifest.required_features.iter().any(|f|f == "monty-modules-v1"));
+    // A submodule edit changes the deploy hash, even when __init__.py is unchanged.
+    std::fs::write(package.join("values.py"), "answer = 43").unwrap();
+    let updated = build(&options(config.clone())).unwrap();
+    assert_ne!(built.version, updated.version);
+    std::fs::write(&config, r#"{"name":"shop","main":"shop/__init__.py"}"#).unwrap();
+    let init = build(&options(config)).unwrap();
+    assert_eq!(updated.modules, init.modules);
+    assert_eq!(init.manifest.do_classes, ["shop.objects.Counter"]);
 }
