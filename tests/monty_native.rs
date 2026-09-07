@@ -11,6 +11,23 @@ fn register() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| celld::native::register(&celld_monty::Monty).unwrap());
 }
+// Production's process domain retains its first Tokio handle, including the
+// HTTP stream sweeper. Independent short-lived test runtimes can close that
+// shared service under another test. Keep one runtime alive, as the daemon does.
+fn run_async(test: impl std::future::Future<Output = ()>) {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        celld::asyncrt::set_host_handle(runtime.handle().clone());
+        runtime
+    });
+    runtime.block_on(test);
+}
+
 fn config(source: &str) -> Arc<WorkerConfig> {
     register();
     Arc::new(WorkerConfig::new(WorkerConfigOptions {
@@ -81,51 +98,53 @@ fn native_programs_run_on_multiple_threads_without_v8() {
     }
 }
 
-#[tokio::test]
-async fn native_suspension_body_limits_and_cancellation_release_capacity() {
-    let mut worker = Worker::load_config(config(
-        "async def run(ctx):\n    await ctx.sleep(0)\n    return b'complete'",
-    ))
-    .unwrap();
-    let (job, reply) = request(RequestBody::Bytes("{}".into()));
-    let (entry, mut ops) = worker.turn_begin(job, None);
-    let mut entry = entry.unwrap();
-    assert!(!entry.finished());
-    assert_eq!(ops.len(), 1);
-    let (id, op) = ops.pop().unwrap();
-    assert!(worker.turn_deliver(&mut entry, id, op.await).is_empty());
-    assert_eq!(reply.await.unwrap().unwrap().body, b"complete");
-    assert!(entry.finished());
-
-    let mut pending = Vec::new();
-    for _ in 0..256 {
+#[test]
+fn native_suspension_body_limits_and_cancellation_release_capacity() {
+    run_async(async {
+        let mut worker = Worker::load_config(config(
+            "async def run(ctx):\n    await ctx.sleep(0)\n    return b'complete'",
+        ))
+        .unwrap();
         let (job, reply) = request(RequestBody::Bytes("{}".into()));
-        let (entry, ops) = worker.turn_begin(job, None);
-        assert!(!entry.as_ref().unwrap().finished());
-        pending.push((entry.unwrap(), ops, reply));
-    }
-    let (job, reply) = request(RequestBody::Bytes("{}".into()));
-    assert!(worker.turn_begin(job, None).0.is_none());
-    assert_eq!(reply.await.unwrap().unwrap().status, 503);
-    for (mut entry, ops, reply) in pending {
-        worker.turn_cancel(&mut entry);
-        drop(ops);
-        entry.abandon();
-        assert!(reply.await.unwrap().is_err());
+        let (entry, mut ops) = worker.turn_begin(job, None);
+        let mut entry = entry.unwrap();
+        assert!(!entry.finished());
+        assert_eq!(ops.len(), 1);
+        let (id, op) = ops.pop().unwrap();
+        assert!(worker.turn_deliver(&mut entry, id, op.await).is_empty());
+        assert_eq!(reply.await.unwrap().unwrap().body, b"complete");
         assert!(entry.finished());
-    }
-    let stream = Box::pin(futures_util::stream::iter([
-        Ok(vec![b'x'; 1024 * 1024]),
-        Ok(vec![b'x']),
-    ]));
-    let id = celld::js::register_body_stream(stream).unwrap();
-    let (job, reply) = request(RequestBody::Stream(id));
-    let (entry, mut ops) = worker.turn_begin(job, None);
-    let mut entry = entry.unwrap();
-    let (id, op) = ops.pop().unwrap();
-    worker.turn_deliver(&mut entry, id, op.await);
-    assert_eq!(reply.await.unwrap().unwrap().status, 413);
-    assert!(entry.finished());
+
+        let mut pending = Vec::new();
+        for _ in 0..256 {
+            let (job, reply) = request(RequestBody::Bytes("{}".into()));
+            let (entry, ops) = worker.turn_begin(job, None);
+            assert!(!entry.as_ref().unwrap().finished());
+            pending.push((entry.unwrap(), ops, reply));
+        }
+        let (job, reply) = request(RequestBody::Bytes("{}".into()));
+        assert!(worker.turn_begin(job, None).0.is_none());
+        assert_eq!(reply.await.unwrap().unwrap().status, 503);
+        for (mut entry, ops, reply) in pending {
+            worker.turn_cancel(&mut entry);
+            drop(ops);
+            entry.abandon();
+            assert!(reply.await.unwrap().is_err());
+            assert!(entry.finished());
+        }
+        let stream = Box::pin(futures_util::stream::iter([
+            Ok(vec![b'x'; 1024 * 1024]),
+            Ok(vec![b'x']),
+        ]));
+        let id = celld::js::register_body_stream(stream).unwrap();
+        let (job, reply) = request(RequestBody::Stream(id));
+        let (entry, mut ops) = worker.turn_begin(job, None);
+        let mut entry = entry.unwrap();
+        let (id, op) = ops.pop().unwrap();
+        worker.turn_deliver(&mut entry, id, op.await);
+        assert_eq!(reply.await.unwrap().unwrap().status, 413);
+        assert!(entry.finished());
+    });
 }
 
 fn pool(config: Arc<WorkerConfig>, density: usize) -> Pool {
@@ -183,65 +202,67 @@ fn native_cell_packing_keeps_the_density_bound_under_concurrent_activation() {
     }
 }
 
-#[tokio::test]
-async fn native_packing_drains_suspended_workers_and_preserves_global_identity() {
-    let config = config("async def run(ctx):\n    await ctx.sleep(0)\n    return b'complete'");
-    let pool = pool(config.clone(), 3);
-    let a = pool.place_cell().unwrap();
-    let b = pool.place_cell().unwrap();
-    let c = pool.place_cell().unwrap();
-    let d = pool.place_cell().unwrap();
-    assert_eq!(a.slot().heap_id(), c.slot().heap_id());
-    assert_ne!(a.slot().heap_id(), d.slot().heap_id());
+#[test]
+fn native_packing_drains_suspended_workers_and_preserves_global_identity() {
+    run_async(async {
+        let config = config("async def run(ctx):\n    await ctx.sleep(0)\n    return b'complete'");
+        let pool = pool(config.clone(), 3);
+        let a = pool.place_cell().unwrap();
+        let b = pool.place_cell().unwrap();
+        let c = pool.place_cell().unwrap();
+        let d = pool.place_cell().unwrap();
+        assert_eq!(a.slot().heap_id(), c.slot().heap_id());
+        assert_ne!(a.slot().heap_id(), d.slot().heap_id());
 
-    // Eviction has opened holes in two workers. Fill the fullest one so the
-    // sparse worker can reach zero instead of continually being refilled.
-    drop(b);
-    let e = pool.place_cell().unwrap();
-    assert_eq!(e.slot().heap_id(), a.slot().heap_id());
+        // Eviction has opened holes in two workers. Fill the fullest one so the
+        // sparse worker can reach zero instead of continually being refilled.
+        drop(b);
+        let e = pool.place_cell().unwrap();
+        assert_eq!(e.slot().heap_id(), a.slot().heap_id());
 
-    // A distinct script/generation may reuse a slot index, never its identity.
-    let other = self::pool(config, 3);
-    let other_cell = other.place_cell().unwrap();
-    assert_eq!(other_cell.slot().id, a.slot().id);
-    assert_ne!(other_cell.slot().heap_id(), a.slot().heap_id());
+        // A distinct script/generation may reuse a slot index, never its identity.
+        let other = self::pool(config, 3);
+        let other_cell = other.place_cell().unwrap();
+        assert_eq!(other_cell.slot().id, a.slot().id);
+        assert_ne!(other_cell.slot().heap_id(), a.slot().heap_id());
 
-    let sparse = d.slot().clone();
-    let affiliation = sparse.affiliate();
-    let (job, reply) = request(RequestBody::Bytes("{}".into()));
-    let (entry, mut ops) = sparse.turn(|worker| worker.turn_begin(job, None)).await;
-    let mut entry = entry.unwrap();
-    assert!(!entry.finished());
-    assert_eq!(ops.len(), 1);
-    drop(d);
-    pool.reap_empty();
-    assert!(sparse.is_retiring());
-    assert!(!a.slot().is_retiring());
+        let sparse = d.slot().clone();
+        let affiliation = sparse.affiliate();
+        let (job, reply) = request(RequestBody::Bytes("{}".into()));
+        let (entry, mut ops) = sparse.turn(|worker| worker.turn_begin(job, None)).await;
+        let mut entry = entry.unwrap();
+        assert!(!entry.finished());
+        assert_eq!(ops.len(), 1);
+        drop(d);
+        pool.reap_empty();
+        assert!(sparse.is_retiring());
+        assert!(!a.slot().is_retiring());
 
-    // An empty but suspended worker cannot be freed or reused.
-    let f = pool.place_cell().unwrap();
-    assert_ne!(f.slot().id, sparse.id);
-    let (id, operation) = ops.pop().unwrap();
-    let result = operation.await;
-    sparse
-        .turn(|worker| worker.turn_deliver(&mut entry, id, result))
-        .await;
-    assert!(entry.finished());
-    assert_eq!(reply.await.unwrap().unwrap().body, b"complete");
-    drop(entry);
-    drop(affiliation);
-    drop(f);
-    pool.reap_empty();
+        // An empty but suspended worker cannot be freed or reused.
+        let f = pool.place_cell().unwrap();
+        assert_ne!(f.slot().id, sparse.id);
+        let (id, operation) = ops.pop().unwrap();
+        let result = operation.await;
+        sparse
+            .turn(|worker| worker.turn_deliver(&mut entry, id, result))
+            .await;
+        assert!(entry.finished());
+        assert_eq!(reply.await.unwrap().unwrap().body, b"complete");
+        drop(entry);
+        drop(affiliation);
+        drop(f);
+        pool.reap_empty();
 
-    // Once drained, the stable slot index is reusable with a fresh identity.
-    let replacement = pool.place_cell().unwrap();
-    assert_eq!(replacement.slot().id, sparse.id);
-    assert_ne!(replacement.slot().heap_id(), sparse.heap_id());
-    drop((a, c, e, replacement, other_cell));
-    pool.reap_empty();
-    other.reap_empty();
-    assert!(pool.is_drained());
-    assert!(other.is_drained());
+        // Once drained, the stable slot index is reusable with a fresh identity.
+        let replacement = pool.place_cell().unwrap();
+        assert_eq!(replacement.slot().id, sparse.id);
+        assert_ne!(replacement.slot().heap_id(), sparse.heap_id());
+        drop((a, c, e, replacement, other_cell));
+        pool.reap_empty();
+        other.reap_empty();
+        assert!(pool.is_drained());
+        assert!(other.is_drained());
+    });
 }
 
 fn options(config: std::path::PathBuf) -> Options {
