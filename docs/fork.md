@@ -80,8 +80,19 @@ python3 tools/storage-checks/probe.py target/release/celld -v
 
 The **Native binaries** workflow builds native release binaries for:
 
-- Linux x86-64 and ARM64 (GNU/glibc, built on Ubuntu 22.04).
+- Linux x86-64 and ARM64 (GNU, glibc 2.28 or later).
 - macOS Intel and Apple Silicon (built on macOS 15).
+
+Linux artifacts are built natively in pinned manylinux 2.28 images on the
+GitHub Ubuntu runners. The complete link uses the old glibc environment,
+including bundled C/C++ dependencies. CI audits the final ELF version needs,
+shared libraries and interpreter, then runs V8, Monty, SQLite restart and S3
+protocol checks in a separate AlmaLinux 8.10 container with glibc 2.28. The
+same binaries also run the normal checks on the newer runner.
+
+`BUILD_INFO.json` records the verified glibc requirement and binary hash for
+each Linux artifact. See [Linux compatibility](linux-compatibility.md) for
+local reproduction and the support boundary.
 
 Every push to `main` builds and publishes a normal GitHub release after all four
 platforms and the Rust, typing, and HTTP validation suite pass. No manual version

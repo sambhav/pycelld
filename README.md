@@ -11,7 +11,7 @@ patches reproduce the included host sources from celld 0.4.1.
 ## Build and run
 
 [Download celld binaries](https://github.com/sambhav/pycelld/releases/latest) for Linux
-and macOS, on x86-64 and ARM64. Every push to `main` automatically publishes a
+and macOS, on x86-64 and ARM64. Linux binaries require glibc 2.28 or later. Every push to `main` automatically publishes a
 tested release such as `0.4.1-pycelld.4`: upstream celld version plus an increasing
 build number. Checksums and Python editor types are included. See
 [installation and versioning](docs/fork.md#download-and-release-binaries).
