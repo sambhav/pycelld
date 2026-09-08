@@ -260,12 +260,9 @@ impl Session {
             if let RunProgress::OsCall(mut call) = progress {
                 self.calls += 1;
                 if self.calls > 10_000 { return Err("host call limit exceeded".into()); }
-                let append = matches!(&call.function_call,
-                    monty_types::OsFunctionCall::AppendText(_) | monty_types::OsFunctionCall::AppendBytes(_));
                 let operation = std::mem::replace(&mut call.function_call, monty_types::OsFunctionCall::GetEnviron);
                 match filesystem::request(operation) {
-                    Ok((mut request, result)) => {
-                        if let celld_runtime::filesystem::FsCall::Write { append: flag, .. } = &mut request { *flag = append; }
+                    Ok((request, result)) => {
                         self.filesystem_call = Some(request);
                         self.pending_os = Some((call, result));
                         return Ok(json!({"done":false,"operation":"filesystem"}));

@@ -94,7 +94,8 @@ fn write(c: &Connection, path: &str, data: &[u8], append: bool) -> anyhow::Resul
 fn descendants(c: &Connection, path: &str) -> anyhow::Result<Vec<String>> {
     let prefix = if path == "/" { "/".to_owned() } else { format!("{path}/") };
     let mut stmt = c.prepare("SELECT path FROM _cf_pycelld_fs WHERE substr(path,1,length(?1))=?1 AND path!=?2 ORDER BY path")?;
-    Ok(stmt.query_map(params![prefix,path], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?)
+    let paths = stmt.query_map(params![prefix,path], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(paths)
 }
 
 pub(crate) fn call(scope: &str, call: FsCall) -> FsResult {

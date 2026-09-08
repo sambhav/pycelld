@@ -344,3 +344,13 @@ fn filesystem_open_preserves_binary_buffers_and_append() {
     session.resume_filesystem(Ok(FsReply::None)).unwrap();
     assert_eq!(body(&mut session), "2");
 }
+
+#[test]
+fn filesystem_text_decode_errors_keep_python_details() {
+    use celld_runtime::filesystem::*;
+    let module = Module::compile("from pathlib import Path\ndef run():\n    try:\n        Path('binary').read_text()\n    except UnicodeDecodeError as e:\n        return e.start\n").unwrap();
+    let (mut session, _) = Session::start(module.get("run").unwrap(), &json!({}), &json!({})).unwrap();
+    session.take_filesystem_call().unwrap();
+    session.resume_filesystem(Ok(FsReply::Bytes(vec![b'a', 255]))).unwrap();
+    assert_eq!(body(&mut session), "1");
+}

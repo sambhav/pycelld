@@ -20,18 +20,21 @@ diff --git a/crates/celld/native_host.rs b/crates/celld/native_host.rs
 diff --git a/crates/celld/storage.rs b/crates/celld/storage.rs
 --- a/crates/celld/storage.rs
 +++ b/crates/celld/storage.rs
-@@ -1,3 +1,6 @@
+@@ -12,6 +12,9 @@
+ //! `scope -> Connection` map: `open` on activate, `close` on evict. The
+ //! `scope` column survives from the single-db era and still keys rows, but a
+ //! db now holds exactly one cell.
 +#[path = "storage_filesystem.rs"]
 +pub(crate) mod filesystem;
 +
- // Copyright 2026 Deno Land Inc. Apache-2.0 license.
- 
- // This is V8-thread SQLite plumbing outside the Actor execution domain.
+ use anyhow::Context as _;
+ use rusqlite::{Connection, OptionalExtension};
+ use std::cell::RefCell;
 diff --git a/crates/celld/storage_filesystem.rs b/crates/celld/storage_filesystem.rs
 new file mode 100644
 --- /dev/null
 +++ b/crates/celld/storage_filesystem.rs
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,284 @@
 +//! Object-local files are ordinary replicated SQLite rows, never host paths.
 +use super::{with_application_storage_write, with_batch_savepoint};
 +use celld_runtime::filesystem::*;
@@ -128,7 +131,8 @@ new file mode 100644
 +fn descendants(c: &Connection, path: &str) -> anyhow::Result<Vec<String>> {
 +    let prefix = if path == "/" { "/".to_owned() } else { format!("{path}/") };
 +    let mut stmt = c.prepare("SELECT path FROM _cf_pycelld_fs WHERE substr(path,1,length(?1))=?1 AND path!=?2 ORDER BY path")?;
-+    Ok(stmt.query_map(params![prefix,path], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?)
++    let paths = stmt.query_map(params![prefix,path], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
++    Ok(paths)
 +}
 +
 +pub(crate) fn call(scope: &str, call: FsCall) -> FsResult {

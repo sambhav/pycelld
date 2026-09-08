@@ -237,4 +237,49 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
             api::filesystem::FsReply::Bytes(b"persisted".to_vec()));
     }
     worker.own_cell(&scope, None).unwrap();
+
+    // A real sparse restoration through upstream's fault-in VFS. The page
+    // reader stands in for bucket retrieval; no host filesystem is mounted.
+    let image = std::fs::read(path).unwrap();
+    let size = u16::from_be_bytes([image[16], image[17]]) as u32;
+    let pages = Arc::new(FilePages { image, size: if size == 1 { 65536 } else { size },
+        reads: std::sync::atomic::AtomicU64::new(0) });
+    let restored = root.path().join("restored.sqlite");
+    let vfs = celld_ltx::paged_vfs::next_registration_name();
+    celld_ltx::paged_vfs::register_paged_vfs(&vfs, None, &restored, pages.clone()).unwrap();
+    worker.own_cell(&scope, Some(CellStorage { path: restored.to_str().unwrap(), epoch: 9, vfs: Some(&vfs) })).unwrap();
+    {
+        let _cells = worker.cells.install();
+        use api::filesystem::{FsCall, FsReply};
+        assert_eq!(storage::filesystem::call(&scope, FsCall::Read("note".into())).unwrap(),
+            FsReply::Bytes(b"persisted".to_vec()));
+        storage::filesystem::call(&scope, FsCall::Write { path: "note".into(), data: b" restored".to_vec(), append: true }).unwrap();
+    }
+    assert!(pages.reads.load(Ordering::Relaxed) > 0, "restore must fault in database pages");
+    worker.own_cell(&scope, None).unwrap();
+    worker.own_cell(&scope, Some(CellStorage { path: restored.to_str().unwrap(), epoch: 10, vfs: Some(&vfs) })).unwrap();
+    {
+        let _cells = worker.cells.install();
+        assert_eq!(storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into())).unwrap(),
+            api::filesystem::FsReply::Bytes(b"persisted restored".to_vec()));
+    }
+    worker.own_cell(&scope, None).unwrap();
+    celld_ltx::paged_vfs::unregister_paged_vfs(&vfs).unwrap();
+}
+
+
+struct FilePages {
+    image: Vec<u8>,
+    size: u32,
+    reads: std::sync::atomic::AtomicU64,
+}
+impl celld_ltx::paged_vfs::PageReader for FilePages {
+    fn page_size(&self) -> u32 { self.size }
+    fn commit(&self) -> u32 { (self.image.len() / self.size as usize) as u32 }
+    fn read_run(&self, pgno: u32) -> celld_ltx::error::Result<Vec<(u32, Vec<u8>)>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let offset = (pgno as usize - 1) * self.size as usize;
+        Ok(self.image.get(offset..offset+self.size as usize)
+            .map(|bytes| vec![(pgno, bytes.to_vec())]).unwrap_or_default())
+    }
 }

@@ -1,6 +1,3 @@
-#[path = "storage_filesystem.rs"]
-pub(crate) mod filesystem;
-
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -15,6 +12,9 @@ pub(crate) mod filesystem;
 //! `scope -> Connection` map: `open` on activate, `close` on evict. The
 //! `scope` column survives from the single-db era and still keys rows, but a
 //! db now holds exactly one cell.
+#[path = "storage_filesystem.rs"]
+pub(crate) mod filesystem;
+
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;

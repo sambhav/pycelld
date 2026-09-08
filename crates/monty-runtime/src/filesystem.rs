@@ -11,6 +11,7 @@ pub(crate) enum ResultType {
 
 pub(crate) fn request(call: OsFunctionCall) -> Result<(FsCall, ResultType), MontyException> {
     use OsFunctionCall::*;
+    let append = matches!(&call, AppendText(_) | AppendBytes(_));
     let mut result = ResultType::Value;
     let request = match call {
         Exists(p) => FsCall::Exists(p.into_string()),
@@ -23,13 +24,12 @@ pub(crate) fn request(call: OsFunctionCall) -> Result<(FsCall, ResultType), Mont
         Iterdir(p) => FsCall::List(p.into_string()),
         Resolve(p) | Absolute(p) => FsCall::Resolve(p.into_string()),
         WriteText(a) | AppendText(a) => {
-            // The append flag is supplied by the caller before consuming the OS call.
             result = ResultType::Written(a.data.chars().count());
-            FsCall::Write { path: a.path.into_string(), data: a.data.into_bytes(), append: false }
+            FsCall::Write { path: a.path.into_string(), data: a.data.into_bytes(), append }
         }
         WriteBytes(a) | AppendBytes(a) => {
             result = ResultType::Written(a.data.len());
-            FsCall::Write { path: a.path.into_string(), data: a.data, append: false }
+            FsCall::Write { path: a.path.into_string(), data: a.data, append }
         }
         Open(a) => {
             if matches!(a.mode, FileMode::ReadUpdate(_) | FileMode::WriteUpdate(_) | FileMode::AppendUpdate(_)) {
@@ -48,10 +48,9 @@ pub(crate) fn request(call: OsFunctionCall) -> Result<(FsCall, ResultType), Mont
 }
 
 pub(crate) fn response(reply: FsResult, result: ResultType) -> ExtFunctionResult {
-    let value = reply.and_then(|reply| {
+    let value = reply.map_err(python_error).and_then(|reply| {
         Ok(match (reply, result) {
-            (FsReply::Bytes(bytes), ResultType::Text) => MontyObject::String(String::from_utf8(bytes)
-                .map_err(|_| FsError::new(FsErrorKind::Invalid, "file is not valid UTF-8"))?),
+            (FsReply::Bytes(bytes), ResultType::Text) => MontyObject::String(decode_text(bytes)?),
             (FsReply::None, ResultType::Written(count)) => MontyObject::Int(count as i64),
             (FsReply::Path(path), ResultType::Open(mode)) => MontyObject::FileHandle(MontyFileHandle { path, mode, position: 0 }),
             (FsReply::None, _) => MontyObject::None,
@@ -68,14 +67,29 @@ pub(crate) fn response(reply: FsResult, result: ResultType) -> ExtFunctionResult
     });
     match value {
         Ok(value) => ExtFunctionResult::Return(value),
-        Err(error) => ExtFunctionResult::Error(MontyException::new(match error.kind {
-            FsErrorKind::NotFound => ExcType::FileNotFoundError,
-            FsErrorKind::Exists => ExcType::FileExistsError,
-            FsErrorKind::NotDirectory => ExcType::NotADirectoryError,
-            FsErrorKind::IsDirectory => ExcType::IsADirectoryError,
-            FsErrorKind::Permission => ExcType::PermissionError,
-            FsErrorKind::Invalid => ExcType::ValueError,
-            FsErrorKind::Io => ExcType::OSError,
-        }, Some(error.message))),
+        Err(error) => ExtFunctionResult::Error(error),
     }
+}
+fn python_error(error: FsError) -> MontyException {
+    MontyException::new(match error.kind {
+        FsErrorKind::NotFound => ExcType::FileNotFoundError,
+        FsErrorKind::Exists => ExcType::FileExistsError,
+        FsErrorKind::NotDirectory => ExcType::NotADirectoryError,
+        FsErrorKind::IsDirectory => ExcType::IsADirectoryError,
+        FsErrorKind::Permission => ExcType::PermissionError,
+        FsErrorKind::Invalid => ExcType::ValueError,
+        FsErrorKind::Io => ExcType::OSError,
+    }, Some(error.message))
+}
+fn decode_text(bytes: Vec<u8>) -> Result<String, MontyException> {
+    String::from_utf8(bytes).map_err(|error| {
+        let utf8 = error.utf8_error();
+        let start = utf8.valid_up_to();
+        let end = utf8.error_len().map_or(error.as_bytes().len(), |n| start + n);
+        let first = error.as_bytes()[start];
+        let reason = monty_types::utf8_error_reason(first, utf8.error_len());
+        MontyException::new(ExcType::UnicodeDecodeError,
+            Some(monty_types::unicode_decode_error_msg("utf-8", first, start, end, reason)))
+            .with_data(monty_types::UnicodeErrorData::decode("utf-8", error.as_bytes(), start, end, reason))
+    })
 }
