@@ -143,3 +143,60 @@ For a runtime implementation independent of Monty, use the re-exported
 `pycelld::runtime::Runtime` contract with the same `run` entry point. Lower-level
 host APIs are available through `pycelld::celld`; they follow the pinned host
 version and are not a stable upstream extension API.
+
+## Outbound HTTP middleware
+
+`Monty::new()` and the supplied `celld` binary deny all Python outbound HTTP.
+Workers retain the typed `await ctx.fetch(...)` interface, but cannot grant
+themselves network access. An embedding Rust host installs the policy:
+
+```rust
+use pycelld::{FetchDecision, Monty};
+
+let runtime = Monty::new().with_fetch_middleware(|ctx, mut request| {
+    if request.url.scheme() != "https"
+        || request.url.host_str() != Some("api.example.com")
+        || request.url.port_or_known_default() != Some(443)
+    {
+        return FetchDecision::Deny("destination is not allowed".into());
+    }
+    // Optional tenant-specific policy from ctx.env and ctx.object.
+    request.headers.push(("x-client".into(), "pycelld".into()));
+    FetchDecision::Forward(request)
+});
+```
+
+`FetchRequest` contains a parsed `url::Url`, method, header pairs and native body
+bytes. `FetchContext` contains the originating request URL, environment, optional
+`(class, id)` durable identity and alarm flag. Context comes from the invocation,
+not from the arguments passed to `fetch`.
+
+Register multiple callbacks to form a chain. They run in registration order;
+`Forward(request)` passes any edits to the next callback, then to celld.
+`Deny(message)` raises a catchable Python `RuntimeError`.
+`Respond(pycelld::runtime::Response { status, headers, body })` supplies a response
+without making a network call. Deny and Respond stop the chain. An injected
+Python helper using `ctx.fetch` passes through the same policy as worker code,
+including durable methods and alarms. Middleware is shared across compiled
+programs and worker slots; callbacks must be `Send + Sync + 'static`, bounded,
+and nonblocking. Rust callbacks are trusted host code: independently opening a
+socket in a native extension is outside this fetch policy.
+
+Only absolute HTTP(S) URLs without embedded credentials can be forwarded.
+Request URLs and body limits are checked before each callback and after the
+last rewrite. Request and response bodies remain limited to 1 MiB. Middleware
+can inspect or replace a request or supply a response; it does not currently
+wrap an asynchronous transport response.
+
+Approved network I/O still goes through celld's egress configuration,
+cancellation, timeouts, response-size limits and durability gates. Redirects
+are **not automatically followed**: Python receives the 3xx response. A new
+`ctx.fetch` to its Location runs the full policy again. Hostname rules are URL
+policy, not IP-level network isolation: use controlled destinations or network
+controls when address resolution must be restricted.
+
+Deployments made with this version require `monty-network-policy-v1`, preventing
+older hosts from silently running new deployments with unrestricted fetch.
+Upgrade every serving host and deploy tool. Existing single-file and package
+artifacts still load, now under the configured host policy. TypeScript's egress
+policy is unchanged.

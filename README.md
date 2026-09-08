@@ -67,6 +67,10 @@ Returns map to HTTP responses, and exceptions become structured errors. Durable
 calls preserve supported Python values, including dataclasses. Iterators and
 streaming are deferred.
 
+Outbound HTTP is denied by default. Embedding hosts can install
+[fetch middleware](docs/extensions.md#outbound-http-middleware) to approve,
+rewrite, answer or deny calls without a JavaScript bridge.
+
 Workers can also export a package through its `__init__.py`; set `main` to the
 package directory.
 

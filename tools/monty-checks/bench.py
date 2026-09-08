@@ -85,6 +85,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary',type=Path)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--include-fetch', action='store_true', help='requires a custom host with fetch middleware')
     parser.add_argument('--seconds',type=float,default=2)
     parser.add_argument('--repeats',type=int,default=3)
     parser.add_argument('--concurrency',type=int,nargs='+',default=[1,16])
@@ -126,7 +127,7 @@ def main():
                             except OSError: time.sleep(.1)
                         else: raise RuntimeError('server startup timeout')
                         for concurrency in options.concurrency:
-                            for case in ['hello','echo','object','increment','pause','fetch']:
+                            for case in ['hello','echo','object','increment','pause'] + (['fetch'] if options.include_fetch else []):
                                 clients=min(4,concurrency)
                                 sizes=[concurrency//clients+(i<concurrency%clients) for i in range(clients)]
                                 jobs=[pool.submit(client,port,case,n,options.seconds,f'counter-{repeat}-{concurrency}') for n in sizes]

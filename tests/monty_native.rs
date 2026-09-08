@@ -9,7 +9,15 @@ use tokio::sync::oneshot;
 
 fn register() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| celld::native::register(celld_monty::Monty::new()).unwrap());
+    ONCE.call_once(|| {
+        celld::native::register(celld_monty::Monty::new().with_fetch_middleware(|_, request| {
+            if request.url.host_str() == Some("127.0.0.1") {
+                celld_monty::FetchDecision::Forward(request)
+            } else {
+                celld_monty::FetchDecision::Deny("test host allows only loopback".into())
+            }
+        })).unwrap();
+    });
 }
 // Production's process domain retains its first Tokio handle, including the
 // HTTP stream sweeper. Independent short-lived test runtimes can close that
@@ -291,7 +299,7 @@ fn monty_builds_native_python_without_javascript_modules() {
         .manifest
         .required_features
         .iter()
-        .any(|f| f == "monty-modules-v1"));
+        .any(|f| f == "monty-network-policy-v1"));
     assert!(!built
         .modules
         .iter()
@@ -335,7 +343,7 @@ fn package_deployments_discover_submodule_classes_and_version_every_source() {
     assert_eq!(built.manifest.do_classes, ["shop.objects.Counter"]);
     assert_eq!(built.manifest.sqlite_classes, ["shop.objects.Counter"]);
     assert_eq!(built.modules.len(), 1);
-    assert!(built.manifest.required_features.iter().any(|f|f == "monty-modules-v1"));
+    assert!(built.manifest.required_features.iter().any(|f|f == "monty-network-policy-v1"));
     // A submodule edit changes the deploy hash, even when __init__.py is unchanged.
     std::fs::write(package.join("values.py"), "answer = 43").unwrap();
     let updated = build(&options(config.clone())).unwrap();
@@ -344,4 +352,34 @@ fn package_deployments_discover_submodule_classes_and_version_every_source() {
     let init = build(&options(config)).unwrap();
     assert_eq!(updated.modules, init.modules);
     assert_eq!(init.manifest.do_classes, ["shop.objects.Counter"]);
+}
+
+#[test]
+fn native_fetch_returns_redirects_without_contacting_the_target() {
+    run_async(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/secret", target.local_addr().unwrap());
+        let url = format!("http://{}/redirect", redirect.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = redirect.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let mut worker = Worker::load_config(config(
+            &format!("async def run(ctx):\n    response = await ctx.fetch('{url}')\n    return response.status"),
+        )).unwrap();
+        let (job, reply) = request(RequestBody::Bytes("{}".into()));
+        let (entry, mut ops) = worker.turn_begin(job, None);
+        let mut entry = entry.unwrap();
+        assert_eq!(ops.len(), 1);
+        let (id, op) = ops.pop().unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), op).await.unwrap();
+        assert!(worker.turn_deliver(&mut entry, id, output).is_empty());
+        assert_eq!(reply.await.unwrap().unwrap().body, b"302");
+        server.await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), target.accept()).await.is_err());
+    });
 }

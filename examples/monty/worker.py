@@ -1,4 +1,4 @@
-from celld import Context, Response
+from celld import Context
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -19,10 +19,6 @@ def increment(ctx: Context, id: str, amount: int = 1) -> Count:
 
 def fail() -> None:
     raise ValueError("example failure")
-
-
-async def upstream(ctx: Context, url: str) -> Response:
-    return await ctx.fetch(url)
 
 
 class Counter:

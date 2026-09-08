@@ -774,7 +774,7 @@ fn native_fetch(
     context: Arc<IoContext>,
     trace: Option<crate::telemetry::TraceContext>,
 ) -> impl std::future::Future<Output = Result<reqwest::Response, String>> + Send {
-    let client = HTTP.with(Clone::clone);
+    let client = HTTP_MANUAL.with(Clone::clone);
     let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
     let api::Request {
         url,

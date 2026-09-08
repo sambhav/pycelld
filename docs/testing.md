@@ -42,7 +42,7 @@ The release tests cover numeric versioning, concurrent build completion order,
 idempotent reruns, draft recovery, and refusal to replace mismatched tags or assets.
 
 The end-to-end test starts local celld processes and checks real HTTP responses,
-POST routing, dataclasses, buffered bytes, native fetch, durable calls,
+POST routing, dataclasses, buffered bytes, default network denial, durable calls,
 concurrency, transactions, SQL, alarms, cancellation, and disk recovery. Storage
 compatibility checks exercise conditional writes against strict local S3
 fixtures.
@@ -67,3 +67,10 @@ Every benchmark response is validated; errors abort the run. Both runtimes use
 the same binary, local HTTP, one stateless slot, and identical workloads.
 See the [benchmark report](../tools/monty-checks/bench/README.md) for results and
 measurement limitations. Streaming and remote iterators remain outside scope.
+
+
+Runtime extension tests cover fetch middleware ordering, URL rewriting, denial,
+synthetic binary responses, request limits, and durable/helper calls. Native
+host integration tests exercise a real loopback 302 response and verify its
+target receives no connection. The binary end-to-end suite verifies that the
+stock runtime denies fetch.

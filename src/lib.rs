@@ -5,7 +5,10 @@
 //! patches through this crate's dependencies; no consumer-side patch step is needed.
 
 pub use celld;
-pub use celld_monty::{ExcType, Monty, PythonError, PythonModule, PythonResult, PythonValue};
+pub use celld_monty::{
+    ExcType, FetchContext, FetchDecision, FetchRequest, Monty, PythonError, PythonModule,
+    PythonResult, PythonValue,
+};
 pub use celld_runtime as runtime;
 
 // Keep upstream's allocator and pressure accounting in custom binaries too.

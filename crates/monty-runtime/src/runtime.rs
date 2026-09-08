@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct Monty {
+    pub(crate) network: crate::network::Network,
     pub(crate) extensions: Arc<crate::extensions::Extensions>,
 }
 impl Monty {
@@ -23,14 +24,14 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-modules-v1",
+    required_feature: "monty-network-policy-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
         &DESCRIPTOR
     }
     fn supported_features(&self) -> Vec<&'static str> {
-        vec!["monty-native-v1", "monty-modules-v1"]
+        vec!["monty-native-v1", "monty-modules-v1", "monty-network-policy-v1"]
     }
     fn types(&self) -> &str {
         &self.extensions.modules["celld"].types
@@ -72,6 +73,7 @@ impl api::Runtime for Monty {
     fn compile(&self, source: &str) -> api::Result<Box<dyn api::Program>> {
         let compiled = prepare(source, &self.extensions)?;
         Ok(Box::new(Program {
+            network: self.network.clone(),
             http: Module::compile_graph(
                 &compiled.graph,
                 &compiled.entry,
@@ -98,6 +100,7 @@ impl api::Runtime for Monty {
 
 #[derive(Clone)]
 struct Program {
+    network: crate::network::Network,
     http: Module,
     objects: HashMap<String, Module>,
     classes: Vec<String>,
@@ -129,6 +132,12 @@ impl Program {
         &self,
         call: api::Invocation,
     ) -> Result<(Box<dyn api::Execution>, Step), Failure> {
+        let fetch_context = crate::FetchContext {
+            request_url: call.request.url.clone(),
+            env: call.env.clone(),
+            object: call.object.as_ref().map(|o| (o.class.clone(), o.id.clone())),
+            alarm: call.alarm,
+        };
         let input = call.request;
         let url =
             url::Url::parse(&input.url).map_err(|_| Failure::arguments("invalid request URL"))?;
@@ -197,6 +206,8 @@ impl Program {
         let (session, event) = Session::start(function, &args, &metadata)?;
         let mut execution = Execution {
             session: Some(session),
+            network: self.network.clone(),
+            fetch_context,
             request: metadata["request"].clone(),
         };
         let step = execution.event(event)?;
@@ -204,7 +215,14 @@ impl Program {
     }
 }
 
+enum Event {
+    Step(Step),
+    Resume(Response),
+}
+
 struct Execution {
+    network: crate::network::Network,
+    fetch_context: crate::FetchContext,
     session: Option<Session>,
     request: Value,
 }
@@ -244,11 +262,18 @@ impl Execution {
                         .ok_or("execution already completed")?
                         .resume(json!({"error":error.message}))?;
                 }
-                result => return result,
+                Ok(Event::Resume(response)) => {
+                    // Interpreter failures after a synthetic reply are final,
+                    // not argument errors on the already-consumed host call.
+                    event = self.session.as_mut().ok_or("execution already completed")?
+                        .resume_fetch(response.status, headers_object(response.headers), response.body)?;
+                }
+                Ok(Event::Step(step)) => return Ok(step),
+                Err(error) => return Err(error),
             }
         }
     }
-    fn event_once(&mut self, event: Value) -> Result<Step, Failure> {
+    fn event_once(&mut self, event: Value) -> Result<Event, Failure> {
         let session = self.session.as_mut().ok_or("execution already completed")?;
         if event["done"] == true {
             let response = match session.take_response() {
@@ -260,7 +285,7 @@ impl Execution {
                 None => json_response(200, json!({"wire":event["wire"]})),
             };
             self.session.take();
-            return Ok(Step::Return(response));
+            return Ok(Event::Step(Step::Return(response)));
         }
         let args = &event["args"];
         let text = |i: usize| {
@@ -354,7 +379,28 @@ impl Execution {
             "log" => HostCall::Log(text(0)?),
             _ => return Err("unknown capability".into()),
         };
-        Ok(Step::Call(call))
+        if let HostCall::Fetch(request) = call {
+            return match self.network.intercept(&self.fetch_context, request) {
+                crate::FetchDecision::Forward(request) => {
+                    Ok(Event::Step(Step::Call(HostCall::Fetch(api::Request {
+                        url: request.url.into(),
+                        method: request.method,
+                        headers: request.headers,
+                        body: request.body,
+                    }))))
+                }
+                crate::FetchDecision::Respond(response) => {
+                    if response.body.len() > 1024 * 1024 {
+                        return Err("fetch response exceeds 1 MiB".into());
+                    }
+                    // The outer event loop resumes locally, avoiding recursive
+                    // Rust calls when Python repeatedly fetches synthetic responses.
+                    Ok(Event::Resume(response))
+                }
+                crate::FetchDecision::Deny(error) => Err(error.into()),
+            };
+        }
+        Ok(Event::Step(Step::Call(call)))
     }
 }
 
@@ -371,6 +417,10 @@ fn complete(response: Response) -> Result<(Box<dyn api::Execution>, Step), Failu
     Ok((
         Box::new(Execution {
             session: None,
+            network: crate::network::Network::default(),
+            fetch_context: crate::FetchContext {
+                request_url: String::new(), env: Value::Null, object: None, alarm: false,
+            },
             request: Value::Null,
         }),
         Step::Return(response),
