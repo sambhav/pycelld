@@ -231,6 +231,7 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
     assert!(entry.finished() && ops.is_empty());
     let response = reply.await.unwrap().unwrap();
     assert_eq!(response.status, 200);
+    assert_eq!(response.write_position, None, "reading existing files must not create a new write");
     {
         let _cells = worker.cells.install();
         assert_eq!(storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into())).unwrap(),

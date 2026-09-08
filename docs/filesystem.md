@@ -34,7 +34,9 @@ def save(ctx: Context, id: str, text: str) -> None:
 Supported operations: text and binary reads/writes, append, `mkdir`, `iterdir`,
 `exists`, `is_file`, `is_dir`, `stat`, `rename`, `unlink`, `rmdir`, `resolve` and
 `absolute`. `is_symlink` returns false. File modes are `r`, `rb`, `w`, `wb`, `a`
-and `ab`, as supported by the pinned Monty version. Text is UTF-8.
+and `ab`, as supported by the pinned Monty version. Text is UTF-8; invalid text
+raises `UnicodeDecodeError`. The pinned interpreter preserves its type and
+message but does not expose all CPython exception attributes.
 
 Missing files, existing destinations, invalid parent directories and denied
 paths raise Python filesystem exceptions. Stateless handlers receive

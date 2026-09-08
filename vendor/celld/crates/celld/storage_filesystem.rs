@@ -22,7 +22,11 @@ fn normalize(path: &str) -> anyhow::Result<String> {
     if parts.len() > MAX_DEPTH {
         return Err(fail(FsErrorKind::Invalid, "path depth limit exceeded"));
     }
-    Ok(format!("/{}", parts.join("/")))
+    let normalized = format!("/{}", parts.join("/"));
+    if normalized.len() > MAX_PATH_BYTES {
+        return Err(fail(FsErrorKind::Invalid, "normalized path exceeds 4096 bytes"));
+    }
+    Ok(normalized)
 }
 fn parent(path: &str) -> &str {
     match path.rsplit_once('/').unwrap().0 { "" => "/", value => value }
@@ -261,6 +265,19 @@ mod tests {
         assert!(run(&c, FsCall::Rename { src: "src".into(), dst: dst.clone() }).is_err());
         assert_eq!(run(&c, FsCall::IsDir(dst)).unwrap(), FsReply::Bool(true));
         assert_eq!(run(&c, FsCall::IsDir("src/child".into())).unwrap(), FsReply::Bool(true));
+    }
+    #[test]
+    fn entry_and_path_limits_are_enforced_without_partial_changes() {
+        let c = Connection::open_in_memory().unwrap();
+        for i in 0..MAX_ENTRIES-1 { run(&c, put(&format!("f{i}"), &[])).unwrap(); }
+        assert!(run(&c, mkdir("extra/child")).is_err());
+        assert_eq!(run(&c, FsCall::Exists("extra".into())).unwrap(), FsReply::Bool(false));
+        run(&c, FsCall::Unlink("f0".into())).unwrap();
+        run(&c, put("replacement", &[])).unwrap();
+        assert!(normalize(&"x".repeat(MAX_PATH_BYTES)).is_err());
+        assert!(normalize("bad\0name").is_err());
+        assert!(normalize(&std::iter::repeat_n("d", MAX_DEPTH+1).collect::<Vec<_>>().join("/")).is_err());
+        assert_eq!(normalize("notes/../file").unwrap(), "/file");
     }
     #[test]
     fn files_and_other_storage_share_rollback_and_reopen() {

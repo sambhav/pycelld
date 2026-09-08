@@ -5,7 +5,7 @@ with [Monty](https://github.com/pydantic/monty) executing entirely in Rust.
 
 Use the supplied binary, or import the `pycelld` Rust crate to build a host with
 your own Monty functions and classes at custom Python import paths. The crate includes the patched celld host;
-applications need no patch commands or separate celld fork. Three maintained
+applications need no patch commands or separate celld fork. Four maintained
 patches reproduce the included host sources from celld 0.4.1.
 
 ## Build and run
@@ -66,6 +66,10 @@ Send `POST /hello` with `{"name":"Sam"}` or `POST /increment` with
 Returns map to HTTP responses, and exceptions become structured errors. Durable
 calls preserve supported Python values, including dataclasses. Iterators and
 streaming are deferred.
+
+Durable objects can use [`pathlib.Path` and `open()`](docs/filesystem.md) for
+persistent files and folders. Each object has a private root backed by its
+SQLite database, sharing storage transactions and recovery.
 
 Outbound HTTP is denied by default. Embedding hosts can install
 [fetch middleware](docs/extensions.md#outbound-http-middleware) to approve,
