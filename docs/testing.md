@@ -74,3 +74,17 @@ synthetic binary responses, request limits, and durable/helper calls. Native
 host integration tests exercise a real loopback 302 response and verify its
 target receives no connection. The binary end-to-end suite verifies that the
 stock runtime denies fetch.
+
+## Durable filesystem
+
+Runtime tests exercise Monty's existing OS-call suspension, native binary
+buffers, text write counts and catchable filesystem/UTF-8 errors. Storage tests
+cover hierarchy, subtree rename, append, path and quota bounds, atomic failures
+and rollback. The native worker test checks SQL table protection, file write
+positions after a raised handler, ownership reactivation, and a real sparse
+restore through celld's paged VFS using an in-memory page source.
+
+The HTTP test uses `Path` and `open()` from Python durable objects, checks
+isolation and mixed file/key-value rollback, syncs writes, restarts the process
+and reads the files back. It also checks `storage.clear()` and denied stateless
+access. These tests exercise the normal database path; they do not contact S3.

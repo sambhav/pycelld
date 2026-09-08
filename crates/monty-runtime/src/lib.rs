@@ -1,5 +1,6 @@
 //! Native Python compilation, values, capabilities and suspended executions.
 mod exports;
+mod filesystem;
 mod extensions;
 mod modules;
 mod network;
@@ -84,6 +85,8 @@ pub const CAPABILITIES: &[&str] = &[
 
 pub(crate) struct Session {
     pending: Option<FunctionCall>,
+    pending_os: Option<(monty::OsCall, filesystem::ResultType)>,
+    filesystem_call: Option<celld_runtime::filesystem::FsCall>,
     calls: usize,
     rpc: bool,
     response: Option<value::HttpResponse>,
@@ -97,6 +100,8 @@ impl Session {
     ) -> Result<(Self, Value), Failure> {
         let mut session = Self {
             pending: None,
+            pending_os: None,
+            filesystem_call: None,
             calls: 0,
             rpc: function.rpc,
             response: None,
@@ -125,7 +130,21 @@ impl Session {
         }
     }
 
+    pub fn take_filesystem_call(&mut self) -> Result<celld_runtime::filesystem::FsCall, Failure> {
+        self.filesystem_call.take().ok_or_else(|| "no pending filesystem call".into())
+    }
+    pub fn resume_filesystem(&mut self, reply: celld_runtime::filesystem::FsResult) -> Result<Value, Failure> {
+        let (call, result) = self.pending_os.take().ok_or("no pending OS call")?;
+        let progress = call.resume(filesystem::response(reply, result), PrintWriter::Disabled)
+            .map_err(Failure::python)?;
+        self.advance(progress)
+    }
     pub fn resume(&mut self, reply: Value) -> Result<Value, Failure> {
+        if self.pending_os.is_some() {
+            let message = reply["error"].as_str().unwrap_or("filesystem host call failed");
+            return self.resume_filesystem(Err(celld_runtime::filesystem::FsError::new(
+                celld_runtime::filesystem::FsErrorKind::Io, message)));
+        }
         let call = self.pending.take().ok_or("session is not suspended")?;
         if reply.to_string().len() > 1024 * 1024 {
             return Err("host result exceeds 1 MiB".into());
@@ -236,6 +255,23 @@ impl Session {
                         )
                         .map_err(Failure::python)?;
                     continue;
+                }
+            }
+            if let RunProgress::OsCall(mut call) = progress {
+                self.calls += 1;
+                if self.calls > 10_000 { return Err("host call limit exceeded".into()); }
+                let operation = std::mem::replace(&mut call.function_call, monty_types::OsFunctionCall::GetEnviron);
+                match filesystem::request(operation) {
+                    Ok((request, result)) => {
+                        self.filesystem_call = Some(request);
+                        self.pending_os = Some((call, result));
+                        return Ok(json!({"done":false,"operation":"filesystem"}));
+                    }
+                    Err(error) => {
+                        progress = call.resume(ExtFunctionResult::Error(error), PrintWriter::Disabled)
+                            .map_err(Failure::python)?;
+                        continue;
+                    }
                 }
             }
             return match progress {

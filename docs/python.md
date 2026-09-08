@@ -213,6 +213,6 @@ Outbound HTTP is disabled in the supplied binary. Custom Rust hosts can install
 answer or deny each `ctx.fetch` call. A denied request raises `RuntimeError`.
 Redirects are returned without following them.
 
-A persistent filesystem is not implemented yet. See the
-[durable filesystem assessment](filesystem.md) for a design using ordinary
-`pathlib` and `open` operations backed by each object's SQLite database.
+Use [`pathlib` and `open()`](filesystem.md) inside durable objects for persistent
+files and folders. File writes share storage transactions, durability gates and
+database recovery. Each object has a private filesystem root.

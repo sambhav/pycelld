@@ -195,8 +195,8 @@ are **not automatically followed**: Python receives the 3xx response. A new
 policy, not IP-level network isolation: use controlled destinations or network
 controls when address resolution must be restricted.
 
-Deployments made with this version require `monty-network-policy-v1`, preventing
-older hosts from silently running new deployments with unrestricted fetch.
+Deployments made with this version require `monty-filesystem-v1`, preventing
+older hosts from running new deployments without filesystem and network-policy support.
 Upgrade every serving host and deploy tool. Existing single-file and package
 artifacts still load, now under the configured host policy. TypeScript's egress
 policy is unchanged.

@@ -310,3 +310,47 @@ fn outbound_binary_bodies_do_not_expand_into_python_or_json_lists() {
     );
     assert_eq!(session.take_response().unwrap().status, 204);
 }
+
+#[test]
+fn filesystem_suspends_with_native_bytes_and_catchable_errors() {
+    use celld_runtime::filesystem::*;
+    let module = Module::compile("from pathlib import Path\ndef run():\n    p = Path('notes.txt')\n    n = p.write_text('hé')\n    try:\n        p.read_bytes()\n    except FileNotFoundError:\n        return n\n").unwrap();
+    let (mut session, event) = Session::start(module.get("run").unwrap(), &json!({}), &json!({})).unwrap();
+    assert_eq!(event["operation"], "filesystem");
+    match session.take_filesystem_call().unwrap() {
+        FsCall::Write { path, data, append } => {
+            assert_eq!(path, "notes.txt"); assert_eq!(data, "hé".as_bytes()); assert!(!append);
+        }
+        _ => panic!("expected write"),
+    }
+    session.resume_filesystem(Ok(FsReply::None)).unwrap();
+    assert!(matches!(session.take_filesystem_call().unwrap(), FsCall::Read(_)));
+    let event = session.resume_filesystem(Err(FsError::new(FsErrorKind::NotFound, "gone"))).unwrap();
+    assert_eq!(event["done"], true);
+    assert_eq!(body(&mut session), "2");
+}
+
+#[test]
+fn filesystem_open_preserves_binary_buffers_and_append() {
+    use celld_runtime::filesystem::*;
+    let module = Module::compile("def run():\n    with open('data', 'ab') as f:\n        return f.write(b'\\x00\\xff')\n").unwrap();
+    let (mut session, _) = Session::start(module.get("run").unwrap(), &json!({}), &json!({})).unwrap();
+    assert!(matches!(session.take_filesystem_call().unwrap(), FsCall::Open { create: true, truncate: false, .. }));
+    session.resume_filesystem(Ok(FsReply::Path("/data".into()))).unwrap();
+    match session.take_filesystem_call().unwrap() {
+        FsCall::Write { data, append, .. } => { assert_eq!(data, [0,255]); assert!(append); }
+        _ => panic!("expected append"),
+    }
+    session.resume_filesystem(Ok(FsReply::None)).unwrap();
+    assert_eq!(body(&mut session), "2");
+}
+
+#[test]
+fn filesystem_text_decode_errors_keep_python_type_and_message() {
+    use celld_runtime::filesystem::*;
+    let module = Module::compile("from pathlib import Path\ndef run():\n    try:\n        Path('binary').read_text()\n    except UnicodeDecodeError as e:\n        return str(e)\n").unwrap();
+    let (mut session, _) = Session::start(module.get("run").unwrap(), &json!({}), &json!({})).unwrap();
+    session.take_filesystem_call().unwrap();
+    session.resume_filesystem(Ok(FsReply::Bytes(vec![b'a', 255]))).unwrap();
+    assert!(body(&mut session).contains("invalid start byte"));
+}
