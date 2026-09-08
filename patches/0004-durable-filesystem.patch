@@ -323,10 +323,10 @@ new file mode 100644
 +        let c = Connection::open(&path).unwrap();
 +        c.execute_batch("CREATE TABLE kv(value TEXT); INSERT INTO kv VALUES('old');").unwrap();
 +        run(&c, put("note", b"old")).unwrap();
-+        c.execute_batch("BEGIN IMMEDIATE; UPDATE kv SET value='new';").unwrap();
++        super::super::without_sql_authorizer(&c, || c.execute_batch("BEGIN IMMEDIATE; UPDATE kv SET value='new';")).unwrap();
 +        run(&c, put("note", b"new")).unwrap();
 +        run(&c, mkdir("temporary/folder")).unwrap();
-+        c.execute_batch("ROLLBACK").unwrap();
++        super::super::without_sql_authorizer(&c, || c.execute_batch("ROLLBACK")).unwrap();
 +        assert_eq!(c.query_row("SELECT value FROM kv", [], |r| r.get::<_,String>(0)).unwrap(), "old");
 +        drop(c);
 +        let c = Connection::open(&path).unwrap();
