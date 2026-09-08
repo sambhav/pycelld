@@ -70,16 +70,23 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-${{ env.SOURCE_SHA }}
+          key: pycelld-${{ runner.os == 'Linux' && 'glibc228' || 'native' }}-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision', 'tools/linux-checks/build.sh') }}-${{ env.SOURCE_SHA }}
           restore-keys: |
-            pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
-            pycelld-native-${{ matrix.target }}-${{ env.RUST_VERSION }}-
-      - run: cargo xtask prepare
+            pycelld-${{ runner.os == 'Linux' && 'glibc228' || 'native' }}-${{ matrix.target }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision', 'tools/linux-checks/build.sh') }}-
+            pycelld-${{ runner.os == 'Linux' && 'glibc228' || 'native' }}-${{ matrix.target }}-${{ env.RUST_VERSION }}-
+      - name: Build Linux release against glibc 2.28
+        if: runner.os == 'Linux'
+        run: bash tools/linux-checks/build.sh "$TARGET"
+      - name: Prepare native macOS build
+        if: runner.os == 'macOS'
+        run: cargo xtask prepare
       - name: Set the fork release version
         run: echo "CELLD_RELEASE_VERSION=$(python3 tools/release.py version)" >> "$GITHUB_ENV"
       - name: Test cell packing and retirement
+        if: runner.os == 'macOS'
         run: cargo test --manifest-path tools/packing-checks/Cargo.toml --locked
       - name: Build release binary
+        if: runner.os == 'macOS'
         run: cargo xtask build --target "$TARGET" --release
       - name: Cache the successful build before running binary checks
         uses: actions/cache/save@v4
@@ -90,6 +97,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Verify Linux ABI and run on glibc 2.28
+        if: runner.os == 'Linux'
+        run: bash tools/linux-checks/check.sh "$TARGET"
       - name: Test S3 ETag spelling and conditional-write fencing through the binary
         run: python3 tools/storage-checks/probe.py "target/$TARGET/release/celld" -v
       - name: Test native Monty HTTP and durability
@@ -118,6 +128,10 @@ jobs:
           with archive.open('wb') as output:
               subprocess.run(['gzip', '-9', '-n', '-c', str(binary)], stdout=output, check=True)
           assert gzip.decompress(archive.read_bytes()) == binary.read_bytes()
+          linux_abi = json.loads(pathlib.Path('target/linux-abi.json').read_text()) if target.endswith('-linux-gnu') else None
+          if linux_abi is not None:
+              assert linux_abi['baseline'] == '2.28'
+              assert linux_abi['binary_sha256'] == hashlib.sha256(binary.read_bytes()).hexdigest()
           (out / f'build-{target}.json').write_text(json.dumps({
               'target': target, 'version': version, 'source_sha': source,
               'upstream_version': upstream_version,
@@ -125,6 +139,7 @@ jobs:
               'repository': os.environ['GITHUB_REPOSITORY'],
               'upstream_revision': pathlib.Path('upstream/revision').read_text().strip(),
               'rust_version': os.environ['RUST_VERSION'], 'profile': 'release',
+              'linux_abi': linux_abi,
               'archive': archive.name, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
               'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
           }, indent=2) + '\n')
@@ -175,6 +190,12 @@ jobs:
               data = (assets / b['archive']).read_bytes()
               assert hashlib.sha256(data).hexdigest() == b['sha256']
               assert hashlib.sha256(gzip.decompress(data)).hexdigest() == b['binary_sha256']
+              if b['target'].endswith('-linux-gnu'):
+                  assert b['linux_abi']['baseline'] == '2.28'
+                  assert tuple(map(int, b['linux_abi']['required_glibc'].split('.'))) <= (2, 28)
+                  assert b['linux_abi']['binary_sha256'] == b['binary_sha256']
+              else:
+                  assert b['linux_abi'] is None
               checksums.append(f"{b['sha256']}  {b['archive']}")
           (assets / 'SHA256SUMS').write_text('\n'.join(sorted(checksums)) + '\n')
           (assets / 'BUILD_INFO.json').write_text(json.dumps(builds, indent=2) + '\n')
