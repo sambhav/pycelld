@@ -1,7 +1,7 @@
 name: Native Monty
 on:
   pull_request:
-    paths: ['Cargo.*', '.cargo/**', 'src/**', 'vendor/**', 'xtask/**', 'patches/**', 'upstream/**', 'tests/**', 'crates/**', 'examples/**', 'tools/monty-checks/**', 'tools/release.py', 'tools/test_release.py', '.github/workflows/monty.yml', '.github/workflows/release.yml']
+    paths: ['Cargo.*', '.cargo/**', 'src/**', 'vendor/**', 'xtask/**', 'patches/**', 'upstream/**', 'tests/**', 'crates/**', 'examples/**', 'tools/monty-checks/**', 'tools/linux-checks/**', 'tools/release.py', 'tools/test_release.py', '.github/workflows/monty.yml', '.github/workflows/release.yml']
   workflow_dispatch:
   workflow_call:
 permissions:
@@ -29,6 +29,7 @@ jobs:
             monty-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
       - run: pip install mypy==2.3.1
       - run: python -m unittest discover -s tools -p test_release.py -v
+      - run: python -m unittest discover -s tools/linux-checks -v
       - run: MYPYPATH=crates/monty-runtime/src mypy --strict examples/monty/worker.py
       - run: MYPYPATH=crates/monty-runtime/src mypy --strict tools/monty-checks/bench/worker.py
       - run: cargo xtask test
