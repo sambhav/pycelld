@@ -90,3 +90,9 @@ because compiler artifacts occupied about 19 GB of file cache. Releasing that
 cache allowed the same binary to pass. A prior pre-extraction benchmark also
 had an unexplained HTTP 500; its cause remains unknown. The current driver
 captures error bodies and server logs on failure.
+
+
+The supplied binary now denies Python outbound HTTP. The benchmark runner omits
+fetch by default; `--include-fetch` requires a custom binary whose middleware
+permits the benchmark's loopback destination. Historical results above predate
+this policy change and have not been remeasured.

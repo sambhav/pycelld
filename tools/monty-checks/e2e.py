@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory() as directory:
     project = root / "app"
     shutil.copytree("examples/monty", project)
     source = project / "worker.py"
-    text = source.read_text().replace("    def schedule(self,", '''    def inspect(self):
+    text = ("from celld import Response\n" + source.read_text()).replace("    def schedule(self,", '''    def inspect(self):
         return {"id": self.id, "count": self._ctx.storage.get("count", 0),
                 "alarmed": self._ctx.storage.get("alarmed", False)}
 
@@ -79,7 +79,11 @@ def custom(): return Response('created', status=201, headers={"X-Test":"yes"})
 def invalid_header(): return Response('bad', headers={"x-test":"bad\\nvalue"})
 def now(ctx): return ctx.now()
 async def upstream_post(ctx: Context, url: str):
-    return await ctx.fetch(url, method="POST", body=b'{"value":{"ok":true}}')
+    try:
+        await ctx.fetch(url, method="POST", body=b'{"value":{"ok":true}}')
+    except RuntimeError as error:
+        return str(error)
+    return "unexpected network access"
 '''
     text += """
 async def wait_increment(ctx: Context, id: str, seconds: float = 0.01): return await Counter(id, ctx).wait_increment(seconds)
@@ -91,8 +95,11 @@ def remote_error(ctx: Context, id: str):
     except ValueError as error: return str(error)
 def big_binary(): return b'\\xff' * 400000
 async def fetched_bytes(ctx: Context, url: str):
-    response = await ctx.fetch(url, method='POST', body='{}')
-    return len(response.body)
+    try:
+        await ctx.fetch(url, method='POST', body='{}')
+    except RuntimeError as error:
+        return str(error)
+    return "unexpected network access"
 """
     def write_source(text):
         source.write_text(text)
@@ -158,7 +165,7 @@ async def fetched_bytes(ctx: Context, url: str):
                 response.read(); client.close()
 
             assert call("slow") == {"awake":True}
-            assert call("upstream_post", {"url":url+"/echo"}) == {"ok":True}
+            assert "outbound HTTP is disabled" in call("upstream_post", {"url":url+"/echo"})
             assert call("metadata") == {"url":url+"/metadata","env":{"GREETING":"hi"},"id":None}
             key = "cart/東京"
             assert call("increment", {"id":key}) == {"id":key,"value":1}
@@ -178,7 +185,7 @@ async def fetched_bytes(ctx: Context, url: str):
             assert call("sync", {"id": key}) is True
             assert call("remote_error", {"id": key}) == "remote failure"
             assert call("object_metadata", {"id":key}) == {"url":url+"/object_metadata", "env":{"GREETING":"hi"}, "id":key}
-            assert call("fetched_bytes", {"url":url+"/big_binary"}) == 400000
+            assert "outbound HTTP is disabled" in call("fetched_bytes", {"url":url+"/big_binary"})
             with ThreadPoolExecutor(max_workers=8) as pool:
                 values = list(pool.map(lambda _:call("wait_increment",{"id":key}), range(16)))
             assert sorted(values) == list(range(1,17)), values

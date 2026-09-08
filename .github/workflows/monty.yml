@@ -18,7 +18,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -27,6 +28,7 @@ jobs:
           key: monty-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-${{ github.sha }}
           restore-keys: |
             monty-${{ hashFiles('Cargo.lock', 'upstream/Cargo.lock', 'patches/*.patch', 'upstream/revision') }}-
+            monty-
       - run: pip install mypy==2.3.1
       - run: python -m unittest discover -s tools -p test_release.py -v
       - run: python -m unittest discover -s tools/linux-checks -v
@@ -34,5 +36,14 @@ jobs:
       - run: MYPYPATH=crates/monty-runtime/src mypy --strict tools/monty-checks/bench/worker.py
       - run: cargo xtask test
       - run: cargo xtask build
+      - name: Cache the completed build before process-level checks
+        uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - run: python tools/monty-checks/e2e.py target/lab/celld
       - run: python tools/monty-checks/consumer.py

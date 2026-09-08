@@ -2,12 +2,14 @@
 mod exports;
 mod extensions;
 mod modules;
+mod network;
 mod package;
 mod runtime;
 mod value;
 pub use extensions::{PythonModule, PythonResult};
 pub use monty_types::{ExcType, MontyException as PythonError, MontyObject as PythonValue};
 pub use runtime::Monty;
+pub use network::{FetchContext, FetchDecision, FetchRequest};
 
 /// Editor definitions for the built-in Python module.
 pub const TYPES: &str = include_str!("celld.pyi");

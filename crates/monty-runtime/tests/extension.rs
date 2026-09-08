@@ -18,7 +18,7 @@ fn invocation() -> Invocation {
 
 #[test]
 fn typed_boundary_preserves_binary_buffers_and_catchable_host_errors() {
-    let program = Monty::new().compile("async def run(ctx):\n    try:\n        await ctx.sleep(-1)\n    except RuntimeError:\n        return await ctx.fetch('http://test', method='POST', body=b'abc\\x00\\xff')").unwrap();
+    let program = Monty::new().with_fetch_middleware(|_, request| celld_monty::FetchDecision::Forward(request)).compile("async def run(ctx):\n    try:\n        await ctx.sleep(-1)\n    except RuntimeError:\n        return await ctx.fetch('http://test', method='POST', body=b'abc\\x00\\xff')").unwrap();
     let (mut execution, step) = program.start(invocation()).unwrap();
     let Step::Call(HostCall::Fetch(request)) = step else {
         panic!("expected typed fetch")
@@ -415,4 +415,132 @@ fn qualified_imports_preserve_dataclasses_named_like_builtin_response() {
     };
     assert_eq!(response.status, 200);
     assert_eq!(response.body, br#"{"value":42}"#);
+}
+
+#[test]
+fn fetch_is_denied_by_default_and_python_can_catch_it() {
+    let program = Monty::new().compile("async def run(ctx):\n    try: await ctx.fetch('https://example.com')\n    except RuntimeError as error: return str(error)").unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("denied fetch escaped to the host")
+    };
+    assert!(String::from_utf8(response.body).unwrap().contains("outbound HTTP is disabled"));
+}
+
+#[test]
+fn middleware_receives_context_and_rewrites_before_the_next_policy() {
+    use celld_monty::FetchDecision;
+    let runtime = Monty::new()
+        .with_fetch_middleware(|ctx, mut request| {
+            assert_eq!(ctx.request_url, "http://test/run");
+            assert_eq!(ctx.env["TENANT"], "acme");
+            assert!(ctx.object.is_none());
+            assert!(!ctx.alarm);
+            assert_eq!(request.url.host_str(), Some("example.com"));
+            assert_eq!(request.body, b"\x00\xff");
+            request.url.set_host(Some("gateway.example")).unwrap();
+            request.headers.push(("x-tenant".into(), "acme".into()));
+            FetchDecision::Forward(request)
+        })
+        .with_fetch_middleware(|_, request| {
+            assert_eq!(request.url.host_str(), Some("gateway.example"));
+            assert!(request.headers.contains(&("x-tenant".into(), "acme".into())));
+            FetchDecision::Forward(request)
+        });
+    let program = runtime.compile("async def run(ctx): return await ctx.fetch('https://EXAMPLE.com/path', method='POST', body=b'\\x00\\xff')").unwrap().fork();
+    let mut call = invocation();
+    call.env = json!({"TENANT":"acme"});
+    let (_, Step::Call(HostCall::Fetch(request))) = program.start(call).unwrap() else {
+        panic!("expected approved fetch")
+    };
+    assert_eq!(request.url, "https://gateway.example/path");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.body, [0, 255]);
+}
+
+#[test]
+fn middleware_can_deny_after_rewrite_and_short_circuits() {
+    use celld_monty::FetchDecision;
+    let runtime = Monty::new()
+        .with_fetch_middleware(|_, mut request| {
+            request.url.set_host(Some("blocked.example")).unwrap();
+            FetchDecision::Forward(request)
+        })
+        .with_fetch_middleware(|_, request| {
+            assert_eq!(request.url.host_str(), Some("blocked.example"));
+            FetchDecision::Deny("tenant policy denied this call".into())
+        })
+        .with_fetch_middleware(|_, _| panic!("middleware after deny must not run"));
+    let program = runtime.compile("async def run(ctx):\n    try: await ctx.fetch('https://example.com')\n    except RuntimeError as error: return str(error)").unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("denied fetch escaped to transport")
+    };
+    assert_eq!(response.body, b"tenant policy denied this call");
+}
+
+#[test]
+fn synthetic_fetch_responses_preserve_bytes_and_do_not_recurse() {
+    use celld_monty::FetchDecision;
+    let runtime = Monty::new()
+        .with_fetch_middleware(|_, _| FetchDecision::Respond(Response {
+            status: 201, headers: vec![("x-source".into(), "middleware".into())],
+            body: vec![0, 255],
+        }))
+        .with_fetch_middleware(|_, _| panic!("middleware after response must not run"));
+    let program = runtime.compile("async def run(ctx):\n    for i in range(1000):\n        response = await ctx.fetch('https://example.com')\n        assert response.headers['x-source'] == 'middleware'\n    return response").unwrap();
+    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+        panic!("synthetic fetch escaped to transport")
+    };
+    assert_eq!(response.status, 201);
+    assert_eq!(response.body, [0, 255]);
+}
+
+#[test]
+fn middleware_rewrites_cannot_escape_http_or_body_limits() {
+    use celld_monty::FetchDecision;
+    for oversized in [false, true] {
+        let runtime = Monty::new().with_fetch_middleware(move |_, mut request| {
+            if oversized { request.body = vec![0; 1024 * 1024 + 1]; }
+            else { request.url = "file:///etc/passwd".parse().unwrap(); }
+            FetchDecision::Forward(request)
+        });
+        let program = runtime.compile("async def run(ctx):\n    try: await ctx.fetch('https://example.com')\n    except RuntimeError: return 'blocked'").unwrap();
+        let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+            panic!("invalid rewritten request escaped to transport")
+        };
+        assert_eq!(response.body, b"blocked");
+    }
+}
+
+#[test]
+fn fetch_policy_applies_in_durable_methods_and_injected_helpers() {
+    use celld_monty::FetchDecision;
+    let runtime = Monty::new().with_python(
+        "async def upstream(ctx): return await ctx.fetch('https://example.com')",
+        "from celld import Context, Response\nasync def upstream(ctx: Context) -> Response: ...",
+    ).unwrap().with_fetch_middleware(|ctx, _| {
+        let (class, id) = ctx.object.as_ref().unwrap();
+        assert_eq!(class, "Counter");
+        assert_eq!(id, "tenant-1");
+        FetchDecision::Deny("blocked in durable object".into())
+    });
+    let program = runtime.compile("from celld import upstream\nclass Counter:\n    def __init__(self, id, ctx): self._ctx = ctx\n    async def run(self):\n        try: await upstream(self._ctx)\n        except RuntimeError as error: return str(error)\ndef run(): return 0").unwrap();
+    let mut call = invocation();
+    call.object = Some(celld_runtime::Object { class: "Counter".into(), id: "tenant-1".into() });
+    call.request.body = serde_json::to_vec(&json!({"wire":"{\"Dict\":[]}", "request": {}})).unwrap();
+    let (_, Step::Return(response)) = program.start(call).unwrap() else {
+        panic!("durable fetch escaped to transport")
+    };
+    assert!(String::from_utf8(response.body).unwrap().contains("blocked in durable object"));
+}
+
+
+#[test]
+fn python_errors_after_synthetic_responses_keep_their_exception_type() {
+    let runtime = Monty::new().with_fetch_middleware(|_, _| {
+        celld_monty::FetchDecision::Respond(Response { status: 200, headers: vec![], body: vec![] })
+    });
+    let program = runtime.compile("async def run(ctx):\n    await ctx.fetch('https://example.com')\n    raise ValueError('after fetch')").unwrap();
+    let error = program.start(invocation()).err().unwrap();
+    assert_eq!(error.code, "ValueError");
+    assert_eq!(error.message, "after fetch");
 }

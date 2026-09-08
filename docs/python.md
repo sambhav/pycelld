@@ -172,7 +172,7 @@ members are typed without `Any`.
 | `ctx.storage.sync()` | Wait for preceding operations to pass the durability gate |
 | `ctx.alarms.set(when)` | Schedule `alarm(self)` using a `timedelta` or aware `datetime` |
 | `ctx.alarms.get()`, `.delete()` | Inspect or remove the alarm |
-| `await ctx.fetch(url, method="GET", headers=..., body=...)` | Typed `Response`; `.text()` and `.json()` decode its body |
+| `await ctx.fetch(url, method="GET", headers=..., body=...)` | Requires host fetch middleware; returns a typed `Response`, including redirects |
 | `await ctx.sleep(seconds)` | Cancellable sleep, up to 30 seconds |
 | `ctx.now()`, `.uuid()`, `.log(message)` | UTC datetime, random UUID string, and logging |
 
@@ -206,3 +206,13 @@ slot, 16 nested transactions, and a 30-second wall-clock deadline per durable tu
 Monty implements a reduced Python subset. External package installation, native
 Python extensions, `yield`, async iterators, streaming, WebSockets, queues and
 workflows are unsupported.
+
+
+Outbound HTTP is disabled in the supplied binary. Custom Rust hosts can install
+[fetch middleware](extensions.md#outbound-http-middleware) to inspect, rewrite,
+answer or deny each `ctx.fetch` call. A denied request raises `RuntimeError`.
+Redirects are returned without following them.
+
+A persistent filesystem is not implemented yet. See the
+[durable filesystem assessment](filesystem.md) for a design using ordinary
+`pathlib` and `open` operations backed by each object's SQLite database.
