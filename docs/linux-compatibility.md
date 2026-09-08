@@ -13,7 +13,9 @@ a version label would retain that host's glibc requirement.
 
 All Cargo compilation and final linking happen inside the compiler container;
 only the pinned Rust toolchain and download/build caches are shared with the
-runner. Linux build caches have a separate glibc-2.28 prefix. This also avoids
+runner. The container runs with the caller's UID/GID, leaving build outputs and
+Cargo caches accessible to the host. The Rust toolchain is mounted read-only.
+Linux build caches have a separate glibc-2.28 prefix. This also avoids
 reusing C/C++ objects previously built against the runner's newer libc. Ordinary
 local `cargo build` continues to use the local system's libc.
 

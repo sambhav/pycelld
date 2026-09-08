@@ -11,13 +11,16 @@ case "$target:$(uname -m)" in
   *) echo "TARGET must match a native Linux x86-64 or ARM64 host" >&2; exit 1 ;;
 esac
 # PyPA manylinux 2026.09.05-1. Keep caches isolated from host-glibc builds.
+# Build as the caller so Cargo outputs and caches remain writable on the host.
 # Rust is installed on the runner; its toolchain runs on glibc 2.28 too.
-docker run --rm \
+docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:$PWD" -w "$PWD" \
-  -v "$HOME/.cargo:/root/.cargo" -v "$HOME/.rustup:/root/.rustup" \
+  -v "$HOME/.cargo:/cargo" -v "$HOME/.rustup:/rustup:ro" \
+  -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+  -e GIT_CONFIG_GLOBAL=/tmp/pycelld-gitconfig \
   -e TARGET="$target" -e CARGO_BUILD_JOBS -e GITHUB_RUN_NUMBER \
   "$image" bash -euo pipefail -c '
-    export PATH="/root/.cargo/bin:/opt/python/cp312-cp312/bin:$PATH"
+    export PATH="/cargo/bin:/opt/python/cp312-cp312/bin:$PATH"
     test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
     test "$(rustc -vV | sed -n "s/^host: //p")" = "$TARGET"
     git config --global --add safe.directory "$PWD"
