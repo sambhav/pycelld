@@ -20,6 +20,9 @@ impl api::Program for TestProgram {
             .unwrap()
             .to_owned();
         let call = match mode.as_str() {
+            "file-error" => HostCall::Filesystem(api::filesystem::FsCall::Write {
+                path: "note".into(), data: b"persisted".to_vec(), append: false }),
+            "file-read" => HostCall::Filesystem(api::filesystem::FsCall::Read("note".into())),
             "read-error" => HostCall::Get("value".into()),
             "sync" => HostCall::Sync,
             _ => HostCall::Put("value".into(), json!(1)),
@@ -40,7 +43,7 @@ impl api::Execution for TestExecution {
             return Err(error.into());
         }
         match self.0.as_str() {
-            "write-error" | "read-error" => Err("handler raised".into()),
+            "write-error" | "read-error" | "file-error" => Err("handler raised".into()),
             "sleep" => {
                 self.0 = "done".into();
                 Ok(Step::Call(HostCall::Sleep(Duration::from_secs(10))))
@@ -210,6 +213,28 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
         let response = reply.await.unwrap().unwrap();
         assert_eq!(response.status, if proven { 200 } else { 500 });
         assert!(entry.finished());
+    }
+    let (entry, ops, reply) = invoke(&mut worker, &scope, "file-error");
+    assert!(entry.finished() && ops.is_empty());
+    let response = reply.await.unwrap().unwrap();
+    assert_eq!(response.status, 500);
+    let file_position = response.write_position.expect("file writes must reach the output gate even after raise");
+    assert!(file_position >= committed);
+    {
+        let _cells = worker.cells.install();
+        assert!(storage::sql_exec(&scope, "SELECT data FROM _cf_pycelld_fs", &[]).is_err());
+    }
+    // Release ownership and reactivate the same database at a new epoch.
+    worker.own_cell(&scope, None).unwrap();
+    worker.own_cell(&scope, Some(CellStorage { path, epoch: 8, vfs: None })).unwrap();
+    let (entry, ops, reply) = invoke(&mut worker, &scope, "file-read");
+    assert!(entry.finished() && ops.is_empty());
+    let response = reply.await.unwrap().unwrap();
+    assert_eq!(response.status, 200);
+    {
+        let _cells = worker.cells.install();
+        assert_eq!(storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into())).unwrap(),
+            api::filesystem::FsReply::Bytes(b"persisted".to_vec()));
     }
     worker.own_cell(&scope, None).unwrap();
 }

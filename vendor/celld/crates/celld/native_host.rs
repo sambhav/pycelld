@@ -27,6 +27,15 @@ impl Host {
     pub fn call(&mut self, call: HostCall) -> Result<(HostReply, Option<i64>), String> {
         use HostCall::*;
         match call {
+            Filesystem(call) => {
+                let reply = match self.scope.as_deref() {
+                    Some(scope) => storage::filesystem::call(scope, call),
+                    None => Err(celld_runtime::filesystem::FsError::new(
+                        celld_runtime::filesystem::FsErrorKind::Permission,
+                        "filesystem access requires a durable object")),
+                };
+                return Ok((HostReply::Filesystem(reply), None));
+            }
             Now => {
                 return Ok((
                     HostReply::Timestamp(Some(

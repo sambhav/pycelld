@@ -101,6 +101,49 @@ async def fetched_bytes(ctx: Context, url: str):
         return str(error)
     return "unexpected network access"
 """
+    text = "from pathlib import Path\n" + text
+    text = text.replace("    def inspect(self):", """    def files(self, action: str):
+        p = Path('notes/latest.txt')
+        if action == 'save':
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(str(p), 'w') as f:
+                f.write('hello')
+                f.write(' durable')
+            with open(str(p), 'a') as f:
+                f.write(' files')
+            Path('notes/raw').write_bytes(b'\\x00\\xff')
+            self._ctx.storage.sync()
+        if action == 'rollback':
+            try:
+                with self._ctx.storage.transaction() as tx:
+                    tx.set('file_transaction', 'changed')
+                    p.write_text('rolled back')
+                    Path('notes/raw').rename('notes/moved')
+                    raise ValueError('rollback')
+            except ValueError:
+                pass
+        if action == 'missing':
+            try:
+                p.read_text()
+            except FileNotFoundError:
+                return 'missing'
+        if action == 'clear':
+            self._ctx.storage.clear()
+            return p.exists()
+        return {'text': p.read_text(), 'size': p.stat().st_size,
+                'raw': Path('notes/raw').read_bytes() == b'\\x00\\xff',
+                'files': sorted([str(x) for x in Path('notes').iterdir()]),
+                'rolled_back': self._ctx.storage.get('file_transaction') is None}
+
+    def inspect(self):""")
+    text += """
+def files(ctx: Context, id: str, action: str): return Counter(id, ctx).files(action)
+def stateless_files():
+    try:
+        Path('anything').write_text('blocked')
+    except PermissionError:
+        return 'denied'
+"""
     def write_source(text):
         source.write_text(text)
     write_source(text)
@@ -145,6 +188,12 @@ async def fetched_bytes(ctx: Context, url: str):
         try:
             process = start(log)
             assert call("hello") == "Hello, world!"
+            expected_files = {'text': 'hello durable files', 'size': 19, 'raw': True,
+                              'files': ['/notes/latest.txt', '/notes/raw'], 'rolled_back': True}
+            assert call('stateless_files') == 'denied'
+            assert call('files', {'id':'files', 'action':'save'}) == expected_files
+            assert call('files', {'id':'files', 'action':'rollback'}) == expected_files
+            assert call('files', {'id':'other-files', 'action':'missing'}) == 'missing'
             # Chunked input is bounded and collected by the native driver.
             import http.client
             client = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
@@ -237,7 +286,9 @@ async def fetched_bytes(ctx: Context, url: str):
             stop(process); process=None
             process=start(log)
             assert call("inspect",{"id":key})["count"] == 25
-            print("Native Monty HTTP, async cancellation, direct objects, transactions, SQL, alarms, reload and restart passed.")
+            assert call('files', {'id':'files', 'action':'read'}) == expected_files
+            assert call('files', {'id':'files', 'action':'clear'}) is False
+            print("Native Monty filesystem, HTTP, async cancellation, direct objects, transactions, SQL, alarms, reload and restart passed.")
         except BaseException:
             print(log_path.read_text(),file=sys.stderr)
             raise

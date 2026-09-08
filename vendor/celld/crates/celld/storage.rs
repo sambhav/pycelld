@@ -1,3 +1,6 @@
+#[path = "storage_filesystem.rs"]
+pub(crate) mod filesystem;
+
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.

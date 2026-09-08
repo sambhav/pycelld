@@ -75,7 +75,7 @@ values are JSON; fetch and durable-call bodies cross the interface as byte
 buffers. Serialization of remote Python values belongs to Monty.
 
 Monty bundles package sources into a deterministic artifact. New deployments
-require `monty-network-policy-v1`; the runtime also advertises
+require `monty-filesystem-v1`; the runtime also advertises
 `monty-native-v1` and `monty-modules-v1`, and continues loading older single-file
 and package artifacts under the configured network policy. Older hosts reject
 new deployments during feature negotiation.

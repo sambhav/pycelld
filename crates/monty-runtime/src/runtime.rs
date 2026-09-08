@@ -24,14 +24,14 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-network-policy-v1",
+    required_feature: "monty-filesystem-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
         &DESCRIPTOR
     }
     fn supported_features(&self) -> Vec<&'static str> {
-        vec!["monty-native-v1", "monty-modules-v1", "monty-network-policy-v1"]
+        vec!["monty-native-v1", "monty-modules-v1", "monty-network-policy-v1", "monty-filesystem-v1"]
     }
     fn types(&self) -> &str {
         &self.extensions.modules["celld"].types
@@ -235,6 +235,7 @@ impl Execution {
     fn resume_inner(&mut self, reply: HostReply) -> Result<Step, Failure> {
         let session = self.session.as_mut().ok_or("execution already completed")?;
         let event = match reply {
+            HostReply::Filesystem(reply) => session.resume_filesystem(reply)?,
             HostReply::Fetch(r) => {
                 session.resume_fetch(r.status, headers_object(r.headers), r.body)?
             }
@@ -298,6 +299,7 @@ impl Execution {
             .as_str()
             .ok_or("missing host operation")?
         {
+            "filesystem" => HostCall::Filesystem(session.take_filesystem_call()?),
             "storage.get" => HostCall::Get(text(0)?),
             "storage.put" => HostCall::Put(text(0)?, args[1].clone()),
             "storage.delete" => HostCall::Delete(text(0)?),

@@ -1,6 +1,7 @@
 //! Native runtime contract. The host owns I/O, cell authority and durability;
 //! implementations own compilation, language values and suspended executions.
 //! No interpreter, executor, database, or JavaScript types cross this boundary.
+pub mod filesystem;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 
@@ -84,6 +85,7 @@ pub struct Response {
 /// Storage values are JSON. HTTP and durable-call bodies stay native byte
 /// buffers; their encoding belongs to the language runtime, never to the host.
 pub enum HostCall {
+    Filesystem(filesystem::FsCall),
     Get(String),
     Put(String, Value),
     Delete(String),
@@ -117,6 +119,7 @@ pub enum HostCall {
 }
 
 pub enum HostReply {
+    Filesystem(filesystem::FsResult),
     Value(Value),
     Timestamp(Option<i64>),
     Fetch(Response),

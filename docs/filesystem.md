@@ -1,32 +1,9 @@
-# Durable filesystem assessment
+# Durable files
 
-Status: design only. pycelld currently rejects filesystem OS calls; no filesystem
-is mounted, persisted or restored by this change.
-
-## Feasibility
-
-Yes: ordinary file and folder operations can use the same SQLite database and
-durability machinery as a durable object's existing storage. No Monty fork is
-needed. The pinned Monty revision already exposes typed
-[`OsFunctionCall`](https://github.com/pydantic/monty/blob/af272c3116e2525249103f960b79086fd250bcef/crates/monty-types/src/os.rs)
-values and a resumable
-[`OsCall`](https://github.com/pydantic/monty/blob/af272c3116e2525249103f960b79086fd250bcef/crates/monty/src/run_progress.rs).
-`pathlib.Path` and `open()` suspend the interpreter; the Rust host decides what
-those operations mean. File writes yield typed write/append operations, so they
-need not wait for a whole interpreter snapshot to be saved.
-
-Monty's [`monty-fs`](https://github.com/pydantic/monty/tree/af272c3116e2525249103f960b79086fd250bcef/crates/monty-fs)
-implements host directory mounts and an in-memory overlay. Those are useful for
-local mounts but do not automatically participate in celld's replicated SQLite
-state. Serializing an overlay after every request would add whole-tree copying
-and a second commit boundary. A SQLite-backed virtual filesystem fits celld
-better.
-
-## Proposed Python interface
-
-Inside a durable object, `/` is that object's private virtual root. Relative
-paths start there on each invocation. The constructor and context API stay the
-same. For example, after implementing the filesystem:
+Use `pathlib.Path` and `open()` inside a durable object. `/` is that object's
+private root; relative paths start there too. Files and folders live in the
+object's SQLite database and return when celld restores the object. No Monty
+fork, host directory mount, or JavaScript adapter is involved.
 
 ```python
 from pathlib import Path
@@ -38,67 +15,64 @@ class Notebook:
         self._ctx = ctx
 
     def save(self, text: str) -> None:
-        folder = Path("notes")
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / "latest.txt").write_text(text)
+        with self._ctx.storage.transaction():
+            Path("notes").mkdir(parents=True, exist_ok=True)
+            Path("notes/latest.txt").write_text(text)
+            self._ctx.storage.set("last_file", "notes/latest.txt")
 
     def read(self) -> str:
         return Path("notes/latest.txt").read_text()
+
+    def append(self, text: str) -> None:
+        with open("notes/latest.txt", "a") as file:
+            file.write(text)
+
+def save(ctx: Context, id: str, text: str) -> None:
+    Notebook(id, ctx).save(text)
 ```
 
-`open("notes/latest.txt", "w")` should use the same backend. The initial scope
-should cover files, directories, text/bytes, append, listing, stat, rename and
-delete. Start without symlinks, host mounts, devices, sockets, Unix permissions
-or cross-object moves. Do not promise full POSIX semantics or unsupported Monty
-file modes. Persistent access from stateless handlers should raise a clear error;
-call a durable object to select the filesystem owner. An optional ephemeral
-scratch mount can be a separate follow-up.
+Supported operations: text and binary reads/writes, append, `mkdir`, `iterdir`,
+`exists`, `is_file`, `is_dir`, `stat`, `rename`, `unlink`, `rmdir`, `resolve` and
+`absolute`. `is_symlink` returns false. File modes are `r`, `rb`, `w`, `wb`, `a`
+and `ab`, as supported by the pinned Monty version. Text is UTF-8.
 
-## Rust and durability boundary
+Missing files, existing destinations, invalid parent directories and denied
+paths raise Python filesystem exceptions. Stateless handlers receive
+`PermissionError`; call a durable object to select the owner. The Python caller
+cannot select another object's database through a filename.
 
-1. Extend pycelld's Monty session to retain and resume `RunProgress::OsCall`,
-   beside the existing external-function suspension. Keep Monty-specific types
-   inside the Monty runtime crate.
-2. Translate supported operations into a small typed filesystem contract in
-   `celld-runtime`. The native celld host supplies the current object scope;
-   Python must never select another object's database through a path.
-3. Store directories and file contents in reserved SQLite tables. An inode
-   table with `(parent, name)` uniqueness permits directory rename without
-   rewriting every descendant path. Use BLOB contents, not JSON byte arrays.
-4. Run each mutation atomically under the existing object gates and SQLite
-   transactions. File operations inside `ctx.storage.transaction()` should join
-   that transaction, allowing file and key/value changes to commit together.
-   Exceptions outside an explicit transaction should follow existing storage
-   semantics; do not imply automatic rollback of the entire invocation.
-5. Let existing output/egress durability gates govern acknowledgement and
-   `ctx.storage.sync()` cover filesystem writes too. Files become ordinary
-   replicated database pages. Celld's existing LTX/node-log/bucket restoration,
-   including 0.4.1's packed storage path, then restores the hierarchy and data.
+## Persistence and transactions
 
-There is no separate directory export/import on restart. Object activation
-restores the database through celld's normal mechanism; reads resolve from its
-filesystem tables. Open file handles and Python execution state are not durable.
+Every operation uses the active object SQLite connection, including celld's
+paged VFS. Files are BLOBs in a reserved `_cf_` table protected from user SQL.
+File operations join `ctx.storage.transaction()`, including nested rollback.
+A single rename, append or other operation is atomic. Outside a transaction,
+a later Python exception does not roll back earlier writes.
 
-## Work and constraints
+The existing output and external-I/O durability gates cover file writes.
+`ctx.storage.sync()` waits for their durability too. `ctx.storage.clear()`
+removes files along with the object's other storage. The root is recreated on
+the next file operation. First access initializes the filesystem table within
+the same storage transaction.
 
-This is a contained feature, not a mount option we can simply enable. It needs
-OS-call dispatch, scoped SQL-backed operations, typed Python filesystem errors,
-and host integration tests. Normalize paths with virtual POSIX rules; reject
-attempts to traverse above the root, enforce parent-directory and rename rules,
-and never pass these paths to `std::fs`.
+Celld's normal database recovery restores contents and folder structure; no
+separate snapshot/export service is required. Open handles and interpreter state
+are invocation-local. Monty buffers file reads and identifies open files by path;
+do not depend on POSIX handle behavior across rename or unlink. Writes are
+applied when the file method runs, rather than deferred until close.
 
-Set explicit per-file, per-object byte, entry-count, path-depth and directory
-listing limits. Start with bounded whole-file operations suited to Monty's
-current buffered file interface; large files would need a separate chunking
-and resource-budget design. Maintain quotas inside the same transaction as the
-write, including overwrite, append and rollback.
+## Bounds
 
-Validation should cover two-object isolation, nested folders, text and binary
-round trips, atomic rename, transaction rollback, exception mapping, quota and
-path failures, and restore after real process restart and ownership transfer.
-Add a 0.4.1 packed-VFS recovery case to prove filesystem tables use the active
-restored database rather than opening a separate local SQLite file.
+- 1 MiB per file, 16 MiB total file content per object.
+- 1,024 entries including the root, 32 path components, 4,096 UTF-8 bytes per path.
+- Directory listings are sorted and limited by the entry count and 1 MiB reply budget.
+- File operations count toward the invocation's existing 10,000 host-call limit.
 
-Recommendation: implement this SQLite-backed filesystem directly against the
-existing Monty OS-call API. Keep local host mounts and interpreter checkpointing
-out of the initial durable filesystem feature.
+Paths use a virtual POSIX namespace. `.` and `..` are normalized; traversal above
+root and NUL bytes are rejected. Directory moves validate every descendant's
+limits before committing. This bounded implementation stores paths directly;
+a directory move updates at most 1,024 rows inside one savepoint.
+
+There are no host mounts, symlinks, devices, sockets, Unix permission management,
+cross-object moves or large-file streaming. `stat` reports file type, size and
+modification time; synthetic permission bits do not grant host access.
