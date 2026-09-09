@@ -1,9 +1,9 @@
 from celld import Context
 
 
-def run(ctx: Context, id: str, backend: str):
+async def run(ctx: Context, id: str, backend: str):
     print("HTTP request", id)
-    return Reporter(id, ctx).report(backend)
+    return await Reporter(id, ctx).report(backend)
 
 
 class Reporter:
