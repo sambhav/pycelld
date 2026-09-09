@@ -84,6 +84,7 @@ struct Parameter {
 #[derive(Clone)]
 pub struct Function {
     runner: MontyRun,
+    pub(crate) sources: Arc<crate::observability::SourceMap>,
     pub(crate) rpc: bool,
     parameters: BTreeMap<String, Parameter>,
     pub(crate) extensions: Arc<crate::extensions::Extensions>,
@@ -94,6 +95,7 @@ impl Function {
         args: &Value,
         context: &Value,
         limits: celld_runtime::ExecutionLimits,
+        output: &mut crate::observability::Output,
     ) -> Result<RunProgress, crate::Failure> {
         limits.validate()?;
         let args = args
@@ -146,8 +148,12 @@ impl Function {
         );
         self.runner
             .clone()
-            .start(inputs, ResourceTracker::new(limits), PrintWriter::Disabled)
-            .map_err(crate::Failure::python)
+            .start(
+                inputs,
+                ResourceTracker::new(limits),
+                PrintWriter::Callback(output),
+            )
+            .map_err(|error| output.failure(error))
     }
 }
 
@@ -168,10 +174,12 @@ pub(crate) fn prepare(
     let package = crate::package::Package::parse(source)?;
     let mut modules = extensions.sources();
     let mut classes = Vec::new();
+    let mut source_lines = BTreeMap::new();
     for (name, mut module) in package.modules {
         if modules.contains_key(&name) {
             return Err(format!("worker module conflicts with host module: {name}"));
         }
+        source_lines.insert(name.clone(), module.source.lines().count());
         let names = durable_classes(&module.source)?;
         let mut identities = BTreeMap::new();
         for class in names {
@@ -188,7 +196,8 @@ pub(crate) fn prepare(
             .push_str(&durable_proxies(&module.source, &identities)?);
         modules.insert(name, module);
     }
-    let graph = crate::modules::Graph::new(modules)?;
+    let mut graph = crate::modules::Graph::new(modules)?;
+    graph.source_lines = source_lines;
     // Validate all explicit package interfaces before any worker is started.
     for (name, module) in &graph.modules {
         if module.worker {
@@ -295,7 +304,8 @@ impl Module {
                 }
             }
         }
-        let prefix = graph.render(entry)?;
+        let (prefix, sources) = graph.render_mapped(entry)?;
+        let sources = Arc::new(sources);
         let mut functions = BTreeMap::new();
         for (name, module, f) in selected {
             if !f.parameters.posonlyargs.is_empty()
@@ -392,6 +402,7 @@ impl Module {
                 name,
                 Function {
                     runner,
+                    sources: sources.clone(),
                     rpc: class.is_some(),
                     parameters,
                     extensions: extensions.clone(),

@@ -115,3 +115,6 @@ python3 tools/monty-checks/consumer.py  # separate Git dependency, types, HTTP
 
 Upstream architecture and operational documentation are available in the
 [celld repository](https://github.com/denoland/celld/tree/10cb1303dac710dcb3b557e318e08c855261f68b/docs).
+
+Python `print()`, structured logs, tracebacks and custom spans are covered in
+[observability](docs/observability.md), including a local OTLP example.

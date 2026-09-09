@@ -169,6 +169,7 @@ pub(crate) fn exports(name: &str, module: &SourceModule) -> Result<BTreeSet<Stri
 pub(crate) struct Graph {
     pub modules: BTreeMap<String, SourceModule>,
     indices: BTreeMap<String, usize>,
+    pub source_lines: BTreeMap<String, usize>,
 }
 impl Graph {
     pub fn new(mut modules: BTreeMap<String, SourceModule>) -> Result<Self> {
@@ -199,7 +200,11 @@ impl Graph {
             .enumerate()
             .map(|(i, n)| (n.clone(), i))
             .collect();
-        Ok(Self { modules, indices })
+        Ok(Self {
+            modules,
+            indices,
+            source_lines: BTreeMap::new(),
+        })
     }
     pub fn target(&self, module: &str, name: &str) -> String {
         format!("_celld_m{}.{}", self.indices[module], name)
@@ -228,7 +233,8 @@ impl Graph {
             }
         }
     }
-    pub fn render(&self, entry: &str) -> Result<String> {
+    pub fn render_mapped(&self, entry: &str) -> Result<(String, crate::observability::SourceMap)> {
+        let mut sources = crate::observability::SourceMap::default();
         let mut output = String::from(include_str!("module_loader.py"));
         for (name, index) in &self.indices {
             output.push_str(&format!("\n_celld_m{index} = _CelldModule()\n_celld_m{index}.__name__ = {name:?}\n_celld_m{index}.__package__ = {:?}\n", if self.modules[name].package { name.as_str() } else { name.rsplit_once('.').map_or("", |p| p.0) }));
@@ -265,15 +271,60 @@ impl Graph {
                 return Err(format!("{name}: {error}"));
             }
             let mut code = module.source.clone();
+            // Byte positions carry their original line through every linker edit.
+            let mut line = 1usize;
+            let mut origins: Vec<usize> = code
+                .bytes()
+                .map(|b| {
+                    let current = line;
+                    if b == b'\n' {
+                        line += 1;
+                    }
+                    current
+                })
+                .collect();
             rewrite.edits.sort_by_key(|(start, end, _)| (*start, *end));
             for (start, end, replacement) in rewrite.edits.into_iter().rev() {
+                let original = origins.get(start).copied().unwrap_or(line);
+                origins.splice(start..end, std::iter::repeat_n(original, replacement.len()));
                 code.replace_range(start..end, &replacement);
             }
             output.push_str(&format!("\ndef _celld_init_{index}():\n"));
             if code.trim().is_empty() {
                 output.push_str("    pass\n");
             } else {
+                let mut offset = 0;
+                let mut generated_line = output.bytes().filter(|b| *b == b'\n').count() + 1;
+                let original_lines: Vec<_> = module.source.lines().collect();
                 for line in code.lines() {
+                    let original = origins.get(offset).copied().unwrap_or(1);
+                    if module.worker
+                        && original <= self.source_lines.get(name).copied().unwrap_or(usize::MAX)
+                    {
+                        let filename = if name == "__worker__" {
+                            "app.py".into()
+                        } else {
+                            format!(
+                                "{}{}",
+                                name.replace('.', "/"),
+                                if module.package {
+                                    "/__init__.py"
+                                } else {
+                                    ".py"
+                                }
+                            )
+                        };
+                        let preview = original_lines
+                            .get(original - 1)
+                            .copied()
+                            .unwrap_or("")
+                            .to_owned();
+                        sources
+                            .0
+                            .push((generated_line, filename, original, preview));
+                    }
+                    offset += line.len() + 1;
+                    generated_line += 1;
                     output.push_str("    ");
                     output.push_str(line);
                     output.push('\n');
@@ -287,7 +338,7 @@ impl Graph {
             ));
         }
         output.push_str(&format!("}}\n_celld_import({entry:?})\n"));
-        Ok(output)
+        Ok((output, sources))
     }
 }
 

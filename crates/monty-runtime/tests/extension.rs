@@ -6,6 +6,7 @@ fn invocation() -> Invocation {
     Invocation {
         execution: Default::default(),
         limits: Default::default(),
+        observer: None,
         request: Request {
             url: "http://test/run".into(),
             method: "POST".into(),
@@ -425,7 +426,11 @@ fn fetch_is_denied_by_default_and_python_can_catch_it() {
     let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
         panic!("denied fetch escaped to the host")
     };
-    assert!(String::from_utf8(response.body).unwrap().contains("outbound HTTP is disabled"));
+    assert!(
+        String::from_utf8(response.body)
+            .unwrap()
+            .contains("outbound HTTP is disabled")
+    );
 }
 
 #[test]
@@ -445,7 +450,11 @@ fn middleware_receives_context_and_rewrites_before_the_next_policy() {
         })
         .with_fetch_middleware(|_, request| {
             assert_eq!(request.url.host_str(), Some("gateway.example"));
-            assert!(request.headers.contains(&("x-tenant".into(), "acme".into())));
+            assert!(
+                request
+                    .headers
+                    .contains(&("x-tenant".into(), "acme".into()))
+            );
             FetchDecision::Forward(request)
         });
     let program = runtime.compile("async def run(ctx): return await ctx.fetch('https://EXAMPLE.com/path', method='POST', body=b'\\x00\\xff')").unwrap().fork();
@@ -483,10 +492,13 @@ fn middleware_can_deny_after_rewrite_and_short_circuits() {
 fn synthetic_fetch_responses_preserve_bytes_and_do_not_recurse() {
     use celld_monty::FetchDecision;
     let runtime = Monty::new()
-        .with_fetch_middleware(|_, _| FetchDecision::Respond(Response {
-            status: 201, headers: vec![("x-source".into(), "middleware".into())],
-            body: vec![0, 255],
-        }))
+        .with_fetch_middleware(|_, _| {
+            FetchDecision::Respond(Response {
+                status: 201,
+                headers: vec![("x-source".into(), "middleware".into())],
+                body: vec![0, 255],
+            })
+        })
         .with_fetch_middleware(|_, _| panic!("middleware after response must not run"));
     let program = runtime.compile("async def run(ctx):\n    for i in range(1000):\n        response = await ctx.fetch('https://example.com')\n        assert response.headers['x-source'] == 'middleware'\n    return response").unwrap();
     let mut call = invocation();
@@ -503,8 +515,11 @@ fn middleware_rewrites_cannot_escape_http_or_body_limits() {
     use celld_monty::FetchDecision;
     for oversized in [false, true] {
         let runtime = Monty::new().with_fetch_middleware(move |_, mut request| {
-            if oversized { request.body = vec![0; 1024 * 1024 + 1]; }
-            else { request.url = "file:///etc/passwd".parse().unwrap(); }
+            if oversized {
+                request.body = vec![0; 1024 * 1024 + 1];
+            } else {
+                request.url = "file:///etc/passwd".parse().unwrap();
+            }
             FetchDecision::Forward(request)
         });
         let program = runtime.compile("async def run(ctx):\n    try: await ctx.fetch('https://example.com')\n    except RuntimeError: return 'blocked'").unwrap();
@@ -529,22 +544,210 @@ fn fetch_policy_applies_in_durable_methods_and_injected_helpers() {
     });
     let program = runtime.compile("from celld import upstream\nclass Counter:\n    def __init__(self, id, ctx): self._ctx = ctx\n    async def run(self):\n        try: await upstream(self._ctx)\n        except RuntimeError as error: return str(error)\ndef run(): return 0").unwrap();
     let mut call = invocation();
-    call.object = Some(celld_runtime::Object { class: "Counter".into(), id: "tenant-1".into() });
-    call.request.body = serde_json::to_vec(&json!({"wire":"{\"Dict\":[]}", "request": {}})).unwrap();
+    call.object = Some(celld_runtime::Object {
+        class: "Counter".into(),
+        id: "tenant-1".into(),
+    });
+    call.request.body =
+        serde_json::to_vec(&json!({"wire":"{\"Dict\":[]}", "request": {}})).unwrap();
     let (_, Step::Return(response)) = program.start(call).unwrap() else {
         panic!("durable fetch escaped to transport")
     };
-    assert!(String::from_utf8(response.body).unwrap().contains("blocked in durable object"));
+    assert!(
+        String::from_utf8(response.body)
+            .unwrap()
+            .contains("blocked in durable object")
+    );
 }
-
 
 #[test]
 fn python_errors_after_synthetic_responses_keep_their_exception_type() {
     let runtime = Monty::new().with_fetch_middleware(|_, _| {
-        celld_monty::FetchDecision::Respond(Response { status: 200, headers: vec![], body: vec![] })
+        celld_monty::FetchDecision::Respond(Response {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        })
     });
     let program = runtime.compile("async def run(ctx):\n    await ctx.fetch('https://example.com')\n    raise ValueError('after fetch')").unwrap();
     let error = program.start(invocation()).err().unwrap();
     assert_eq!(error.code, "ValueError");
     assert_eq!(error.message, "after fetch");
+}
+
+fn observed_invocation() -> (
+    Invocation,
+    std::sync::Arc<std::sync::Mutex<Vec<celld_runtime::observability::Diagnostic>>>,
+) {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let mut call = invocation();
+    call.observer = Some(std::sync::Arc::new(move |event| {
+        captured.lock().unwrap().push(event)
+    }));
+    (call, events)
+}
+
+#[test]
+fn print_survives_start_resume_caught_errors_and_uncaught_exception() {
+    use celld_runtime::observability::Diagnostic;
+    let program = Monty::new().compile("async def run(ctx):\n    print('before', end='')\n    await ctx.sleep(0)\n    print('after')\n    try:\n        await ctx.sleep(-1)\n    except RuntimeError:\n        print('caught')\n    print('last', end='')\n    raise ValueError('private detail')").unwrap();
+    let (call, events) = observed_invocation();
+    let (mut execution, step) = program.start(call).unwrap();
+    assert!(matches!(step, Step::Call(HostCall::Sleep(_))));
+    assert!(
+        matches!(&events.lock().unwrap()[0], Diagnostic::Log { message, .. } if message == "before")
+    );
+    let error = execution
+        .resume(HostReply::Value(json!(null)))
+        .err()
+        .unwrap();
+    let response = program.error_response(error, false);
+    assert!(
+        !String::from_utf8(response.body)
+            .unwrap()
+            .contains("private detail")
+    );
+    let events = events.lock().unwrap();
+    let messages: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Diagnostic::Log { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(&messages[..4], ["before", "after", "caught", "last"]);
+    assert!(messages[4].contains("line 10"), "{}", messages[4]);
+    assert!(messages[4].contains("raise ValueError('private detail')"));
+}
+
+#[test]
+fn output_is_bounded_across_resumes_and_error_keeps_a_reserved_record() {
+    use celld_runtime::observability::Diagnostic;
+    let program = Monty::new().compile("async def run(ctx):\n    print('é' * 40000)\n    await ctx.sleep(0)\n    print('not captured')\n    raise ValueError('still reported')").unwrap();
+    let (call, events) = observed_invocation();
+    let (mut execution, _) = program.start(call).unwrap();
+    assert!(execution.resume(HostReply::Value(json!(null))).is_err());
+    let events = events.lock().unwrap();
+    let messages: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Diagnostic::Log { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(messages.iter().all(|m| m.len() <= 8192));
+    assert!(messages.iter().map(|m| m.len()).sum::<usize>() <= 65536 + 8192);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.contains("diagnostics truncated"))
+            .count(),
+        1
+    );
+    assert!(!messages.iter().any(|m| *m == "not captured"));
+    assert!(messages.last().unwrap().contains("still reported"));
+}
+
+#[test]
+fn structured_logs_and_custom_spans_survive_await_without_cross_invocation_mix() {
+    use celld_runtime::observability::Diagnostic;
+    let program = Monty::new().compile("async def run(ctx):\n    with ctx.span('calculate', fields={'kind':'test'}):\n        ctx.log('started', fields={'step':1})\n        await ctx.sleep(0)\n        print('finished')").unwrap();
+    let (a, a_events) = observed_invocation();
+    let (b, b_events) = observed_invocation();
+    let (mut a, _) = program.start(a).unwrap();
+    let (mut b, _) = program.start(b).unwrap();
+    b.resume(HostReply::Value(json!(null))).unwrap();
+    assert!(
+        !a_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Diagnostic::Span { .. }))
+    );
+    a.resume(HostReply::Value(json!(null))).unwrap();
+    for events in [a_events, b_events] {
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(matches!(&events[0], Diagnostic::Log { fields, .. } if fields["step"] == 1));
+        assert!(
+            matches!(&events[2], Diagnostic::Span { name, ok: true, fields, .. } if name == "calculate" && fields["kind"] == "test")
+        );
+    }
+}
+
+#[test]
+fn package_traceback_reports_original_module_and_line_after_linker_rewrites() {
+    use celld_runtime::observability::Diagnostic;
+    let source = format!(
+        "# celld:python-package-v1\n{}",
+        json!({"entry":"app","single":false,"modules":{
+            "app":{"source":"from .helper import fail\ndef run(): return fail()", "package":true},
+            "app.helper":{"source":"def other(): return 1\n\ndef fail():\n    raise ValueError('package boom')", "package":false}
+        }})
+    );
+    let program = Monty::new().compile(&source).unwrap();
+    let (call, events) = observed_invocation();
+    assert!(program.start(call).is_err());
+    let events = events.lock().unwrap();
+    let Diagnostic::Log { message, .. } = events.last().unwrap() else {
+        panic!()
+    };
+    assert!(message.contains("app/helper.py\", line 4"), "{message}");
+    assert!(message.contains("app/__init__.py\", line 2"), "{message}");
+    assert!(!message.contains("_celld_"), "{message}");
+}
+
+#[test]
+fn print_after_binary_fetch_filesystem_and_native_extension_resumes_is_captured() {
+    use celld_runtime::observability::Diagnostic;
+    let runtime = Monty::new()
+        .with_fetch_middleware(|_, request| celld_monty::FetchDecision::Forward(request))
+        .with_function("def native() -> int: ...", |_| Ok(PythonValue::Int(1)))
+        .unwrap();
+    let program = runtime.compile("from celld import native\nasync def run(ctx):\n    print(native())\n    await ctx.fetch('http://test')\n    print('fetched')\n    try:\n        open('missing').read()\n    except PermissionError:\n        print('filesystem denied')\n    return None").unwrap();
+    let (call, events) = observed_invocation();
+    let (mut execution, _) = program.start(call).unwrap();
+    let step = execution
+        .resume(HostReply::Fetch(Response {
+            status: 200,
+            headers: vec![],
+            body: vec![0, 255],
+        }))
+        .unwrap();
+    assert!(matches!(step, Step::Call(HostCall::Filesystem(_))));
+    let reply = Err(celld_runtime::filesystem::FsError::new(
+        celld_runtime::filesystem::FsErrorKind::Permission,
+        "denied",
+    ));
+    assert!(matches!(
+        execution.resume(HostReply::Filesystem(reply)).unwrap(),
+        Step::Return(_)
+    ));
+    let events = events.lock().unwrap();
+    let messages: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Diagnostic::Log { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, ["1", "fetched", "filesystem denied"]);
+}
+
+#[test]
+fn span_records_caught_errors_and_public_error_messages_are_opt_in() {
+    use celld_runtime::observability::Diagnostic;
+    let program = Monty::new().with_public_errors(true).compile("def run(ctx):\n    try:\n        with ctx.span('failed'):\n            raise ValueError('caught')\n    except ValueError:\n        print('recovered')\n    raise ValueError('visible')").unwrap();
+    let (call, events) = observed_invocation();
+    let error = program.start(call).err().unwrap();
+    let response = program.error_response(error, false);
+    assert!(
+        String::from_utf8(response.body)
+            .unwrap()
+            .contains("visible")
+    );
+    assert!(
+        matches!(&events.lock().unwrap()[0], Diagnostic::Span {name, ok:false,..} if name == "failed")
+    );
 }
