@@ -1,7 +1,10 @@
 //! Native runtime contract. The host owns I/O, cell authority and durability;
 //! implementations own compilation, language values and suspended executions.
 //! No interpreter, executor, database, or JavaScript types cross this boundary.
+mod execution;
 pub mod filesystem;
+mod payload;
+pub use execution::{ExecutionLimits, ExecutionMetadata, VerifiedPrincipal};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 
@@ -57,6 +60,9 @@ pub enum Step {
 }
 
 pub struct Invocation {
+    /// Authoritative host data; never reconstructed from worker arguments.
+    pub execution: ExecutionMetadata,
+    pub limits: ExecutionLimits,
     pub request: Request,
     pub object: Option<Object>,
     pub alarm: bool,

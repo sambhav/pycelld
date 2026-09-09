@@ -892,6 +892,7 @@ pub struct ServiceFetch {
 
 /// Owned HTTP request crossing from the async shell into a V8 executor.
 pub struct RuntimeFetch {
+    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
     pub url: String,
     pub method: String,
     pub body: js::RequestBody,
@@ -1140,6 +1141,7 @@ impl Generation {
                 .with_loader(loader_binding)
                 .with_queue_consumers(queue_catalog.clone())
                 .with_crons(crons.clone())
+                .with_deployment_id(version.clone())
                 .with_generation(id),
         );
         let stateless = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
@@ -1176,6 +1178,7 @@ impl Generation {
         }
         for target in cohosted {
             let crate::fleet::LoadedDeployment {
+                version: target_version,
                 options,
                 script_name: script,
                 asset_binding,
@@ -1192,6 +1195,7 @@ impl Generation {
                     .with_services(services)
                     .with_asset_binding(asset_binding)
                     .with_queue_consumers(queue_catalog.clone())
+                    .with_deployment_id(target_version)
                     .with_generation(id),
             );
             let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
@@ -1646,6 +1650,7 @@ impl RuntimeManager {
         inline_activity: crate::CellActivityGuard,
     ) -> anyhow::Result<HttpResponse> {
         let RuntimeFetch {
+        native_parent: _,
             url,
             method,
             body,
@@ -2188,6 +2193,7 @@ impl RuntimeManager {
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> anyhow::Result<HttpResponse> {
         let RuntimeFetch {
+        native_parent,
             url,
             method,
             body,
@@ -2219,6 +2225,7 @@ impl RuntimeManager {
         } = admitted;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Fetch {
+            native_parent,
             request_id,
             scope: cell,
             name,

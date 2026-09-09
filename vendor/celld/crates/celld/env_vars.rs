@@ -38,6 +38,7 @@ pub struct ShutdownTiming {
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
+    native_limits()?;
     cell_isolate_limit()?;
     crate::s3_etag::S3EtagMode::from_env()?;
     for name in [
@@ -289,4 +290,19 @@ mod cell_isolate_limit_tests {
             );
         }
     }
+}
+
+/// Process-level native ceilings, never read from worker variables.
+pub fn native_limits() -> anyhow::Result<celld_runtime::ExecutionLimits> {
+    let limits: celld_runtime::ExecutionLimits = match std::env::var("CELLD_NATIVE_LIMITS") {
+        Ok(value) => {
+            serde_json::from_str(&value).map_err(|e| anyhow::anyhow!("CELLD_NATIVE_LIMITS: {e}"))?
+        }
+        Err(std::env::VarError::NotPresent) => Default::default(),
+        Err(error) => anyhow::bail!("CELLD_NATIVE_LIMITS: {error}"),
+    };
+    limits
+        .validate()
+        .map_err(|e| anyhow::anyhow!("CELLD_NATIVE_LIMITS: {e}"))?;
+    Ok(limits)
 }

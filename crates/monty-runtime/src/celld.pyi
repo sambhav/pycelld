@@ -39,7 +39,24 @@ class Response:
     def text(self) -> str: ...
     def json(self) -> Json: ...
 
+class ExecutionMetadata:
+    worker_id: str
+    deployment_id: str
+    invocation_id: str
+    runtime_instance_id: str
+    root_invocation_id: str
+    parent_invocation_id: str | None
+    principal: Json
+
+class ExecutionLimits:
+    cpu_ms: int
+    wall_ms: int
+    max_operations: int
+    max_payload_bytes: int
+
 class Context:
+    execution: ExecutionMetadata
+    limits: ExecutionLimits
     id: str | None
     env: dict[str, str]
     request: Request

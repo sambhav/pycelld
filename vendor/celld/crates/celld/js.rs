@@ -112,6 +112,7 @@ macro_rules! exc {
 /// owner and HTTP-proxies the fetch, replying on `reply` (an async oneshot the
 /// async-op future awaits — the JS thread is never blocked).
 pub struct DoCallReq {
+    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
     pub request_id: Option<RequestId>,
     pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     /// An explicit JavaScript AbortSignal must reach the target handler, even
@@ -2769,6 +2770,7 @@ pub enum AlarmDispatch {
 /// handler to run.
 pub enum CellJob {
     Fetch {
+        native_parent: Option<celld_runtime::ExecutionMetadata>,
         request_id: Option<RequestId>,
         scope: String,
         name: Option<String>,
@@ -3953,6 +3955,8 @@ pub struct QueueConsumerRegistration {
 }
 
 pub struct WorkerConfig {
+    pub deployment_id: Option<String>,
+    pub verified_principal: Option<celld_runtime::VerifiedPrincipal>,
     src: String,
     pub script_name: String,
     do_classes: Vec<String>,
@@ -4085,6 +4089,8 @@ impl WorkerConfig {
             })
             .collect();
         Self {
+            deployment_id: None,
+            verified_principal: None,
             src,
             script_name,
             do_classes,
@@ -4112,6 +4118,17 @@ impl WorkerConfig {
             main_imports,
             module_imports,
         }
+    }
+
+    /// Trusted embedding hosts may attach authentication results; worker code
+    /// and request headers never populate this value.
+    pub fn with_verified_principal(mut self, principal: celld_runtime::VerifiedPrincipal) -> Self {
+        self.verified_principal = Some(principal);
+        self
+    }
+    pub fn with_deployment_id(mut self, id: String) -> Self {
+        self.deployment_id = Some(id);
+        self
     }
 
     /// Stamp this Worker with the application generation it serves.
@@ -5277,22 +5294,14 @@ impl InFlight {
     /// time the handler already spent.
     pub fn remaining(&self, budget: Duration) -> Option<Duration> {
         self.reply.is_some().then(|| {
-            let budget = if self.native.is_some() && self.scope.is_some() {
-                budget.min(Duration::from_secs(30))
-            } else {
-                budget
-            };
+            let budget = self.native.as_ref().map_or(budget, |native| budget.min(native.wall_budget()));
             budget.saturating_sub(self.started.elapsed())
         })
     }
 
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
-        let budget = if self.native.is_some() && self.scope.is_some() {
-            budget.min(Duration::from_secs(30))
-        } else {
-            budget
-        };
+        let budget = self.native.as_ref().map_or(budget, |native| budget.min(native.wall_budget()));
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
@@ -6644,6 +6653,7 @@ fn dispatcher<'s>(
 fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
     match job {
         CellJob::Fetch {
+            native_parent: _,
             request_id,
             scope,
             name,
@@ -9088,6 +9098,7 @@ fn op_facet_fetch(
         .await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Fetch {
+            native_parent: None,
             request_id: None,
             scope: facet_scope,
             name: None,
@@ -9260,6 +9271,7 @@ fn op_do_call_impl(
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     let request = DoCallReq {
+        native_parent: None,
         request_id: Some(request_id),
         cancel: Some(cancel),
         deliver_abort_to_handler: cancellable,

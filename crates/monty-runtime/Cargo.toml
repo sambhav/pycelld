@@ -11,6 +11,10 @@ autotests = false
 name = "extension"
 path = "tests/extension.rs"
 
+[[test]]
+name = "execution"
+path = "tests/execution.rs"
+
 [dependencies]
 celld-runtime = { path = "../runtime-api" }
 url = "2"

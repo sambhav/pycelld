@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 /// Invocation metadata supplied by the host, never by fetch arguments.
 pub struct FetchContext {
+    pub execution: celld_runtime::ExecutionMetadata,
+    pub limits: celld_runtime::ExecutionLimits,
     pub request_url: String,
     pub env: Value,
     /// Durable class identity and ID, or `None` for a stateless handler.

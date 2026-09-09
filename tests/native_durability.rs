@@ -21,7 +21,10 @@ impl api::Program for TestProgram {
             .to_owned();
         let call = match mode.as_str() {
             "file-error" => HostCall::Filesystem(api::filesystem::FsCall::Write {
-                path: "note".into(), data: b"persisted".to_vec(), append: false }),
+                path: "note".into(),
+                data: b"persisted".to_vec(),
+                append: false,
+            }),
             "file-read" => HostCall::Filesystem(api::filesystem::FsCall::Read("note".into())),
             "read-error" => HostCall::Get("value".into()),
             "sync" => HostCall::Sync,
@@ -69,6 +72,7 @@ fn invoke(
     let (reply, receive) = tokio::sync::oneshot::channel();
     let (entry, ops) = worker.turn_begin_cell(
         CellJob::Fetch {
+            native_parent: None,
             scope: scope.into(),
             name: None,
             request_id: None,
@@ -104,6 +108,9 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
         compat: Compat::default(),
     }));
     let mut worker = Worker {
+        runtime_instance_id: "test-slot".into(),
+        deployment_id: "test-deployment".into(),
+        limits: Default::default(),
         config,
         program: Box::new(TestProgram),
         env: json!({}),
@@ -218,7 +225,9 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
     assert!(entry.finished() && ops.is_empty());
     let response = reply.await.unwrap().unwrap();
     assert_eq!(response.status, 500);
-    let file_position = response.write_position.expect("file writes must reach the output gate even after raise");
+    let file_position = response
+        .write_position
+        .expect("file writes must reach the output gate even after raise");
     assert!(file_position >= committed);
     {
         let _cells = worker.cells.install();
@@ -226,16 +235,31 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
     }
     // Release ownership and reactivate the same database at a new epoch.
     worker.own_cell(&scope, None).unwrap();
-    worker.own_cell(&scope, Some(CellStorage { path, epoch: 8, vfs: None })).unwrap();
+    worker
+        .own_cell(
+            &scope,
+            Some(CellStorage {
+                path,
+                epoch: 8,
+                vfs: None,
+            }),
+        )
+        .unwrap();
     let (entry, ops, reply) = invoke(&mut worker, &scope, "file-read");
     assert!(entry.finished() && ops.is_empty());
     let response = reply.await.unwrap().unwrap();
     assert_eq!(response.status, 200);
-    assert_eq!(response.write_position, None, "reading existing files must not create a new write");
+    assert_eq!(
+        response.write_position, None,
+        "reading existing files must not create a new write"
+    );
     {
         let _cells = worker.cells.install();
-        assert_eq!(storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into())).unwrap(),
-            api::filesystem::FsReply::Bytes(b"persisted".to_vec()));
+        assert_eq!(
+            storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into()))
+                .unwrap(),
+            api::filesystem::FsReply::Bytes(b"persisted".to_vec())
+        );
     }
     worker.own_cell(&scope, None).unwrap();
 
@@ -243,31 +267,67 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
     // reader stands in for bucket retrieval; no host filesystem is mounted.
     let image = std::fs::read(path).unwrap();
     let size = u16::from_be_bytes([image[16], image[17]]) as u32;
-    let pages = Arc::new(FilePages { image, size: if size == 1 { 65536 } else { size },
-        reads: std::sync::atomic::AtomicU64::new(0) });
+    let pages = Arc::new(FilePages {
+        image,
+        size: if size == 1 { 65536 } else { size },
+        reads: std::sync::atomic::AtomicU64::new(0),
+    });
     let restored = root.path().join("restored.sqlite");
     let vfs = celld_ltx::paged_vfs::next_registration_name();
     celld_ltx::paged_vfs::register_paged_vfs(&vfs, None, &restored, pages.clone()).unwrap();
-    worker.own_cell(&scope, Some(CellStorage { path: restored.to_str().unwrap(), epoch: 9, vfs: Some(&vfs) })).unwrap();
+    worker
+        .own_cell(
+            &scope,
+            Some(CellStorage {
+                path: restored.to_str().unwrap(),
+                epoch: 9,
+                vfs: Some(&vfs),
+            }),
+        )
+        .unwrap();
     {
         let _cells = worker.cells.install();
         use api::filesystem::{FsCall, FsReply};
-        assert_eq!(storage::filesystem::call(&scope, FsCall::Read("note".into())).unwrap(),
-            FsReply::Bytes(b"persisted".to_vec()));
-        storage::filesystem::call(&scope, FsCall::Write { path: "note".into(), data: b" restored".to_vec(), append: true }).unwrap();
+        assert_eq!(
+            storage::filesystem::call(&scope, FsCall::Read("note".into())).unwrap(),
+            FsReply::Bytes(b"persisted".to_vec())
+        );
+        storage::filesystem::call(
+            &scope,
+            FsCall::Write {
+                path: "note".into(),
+                data: b" restored".to_vec(),
+                append: true,
+            },
+        )
+        .unwrap();
     }
-    assert!(pages.reads.load(Ordering::Relaxed) > 0, "restore must fault in database pages");
+    assert!(
+        pages.reads.load(Ordering::Relaxed) > 0,
+        "restore must fault in database pages"
+    );
     worker.own_cell(&scope, None).unwrap();
-    worker.own_cell(&scope, Some(CellStorage { path: restored.to_str().unwrap(), epoch: 10, vfs: Some(&vfs) })).unwrap();
+    worker
+        .own_cell(
+            &scope,
+            Some(CellStorage {
+                path: restored.to_str().unwrap(),
+                epoch: 10,
+                vfs: Some(&vfs),
+            }),
+        )
+        .unwrap();
     {
         let _cells = worker.cells.install();
-        assert_eq!(storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into())).unwrap(),
-            api::filesystem::FsReply::Bytes(b"persisted restored".to_vec()));
+        assert_eq!(
+            storage::filesystem::call(&scope, api::filesystem::FsCall::Read("note".into()))
+                .unwrap(),
+            api::filesystem::FsReply::Bytes(b"persisted restored".to_vec())
+        );
     }
     worker.own_cell(&scope, None).unwrap();
     celld_ltx::paged_vfs::unregister_paged_vfs(&vfs).unwrap();
 }
-
 
 struct FilePages {
     image: Vec<u8>,
@@ -275,12 +335,89 @@ struct FilePages {
     reads: std::sync::atomic::AtomicU64,
 }
 impl celld_ltx::paged_vfs::PageReader for FilePages {
-    fn page_size(&self) -> u32 { self.size }
-    fn commit(&self) -> u32 { (self.image.len() / self.size as usize) as u32 }
+    fn page_size(&self) -> u32 {
+        self.size
+    }
+    fn commit(&self) -> u32 {
+        (self.image.len() / self.size as usize) as u32
+    }
     fn read_run(&self, pgno: u32) -> celld_ltx::error::Result<Vec<(u32, Vec<u8>)>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let offset = (pgno as usize - 1) * self.size as usize;
-        Ok(self.image.get(offset..offset+self.size as usize)
-            .map(|bytes| vec![(pgno, bytes.to_vec())]).unwrap_or_default())
+        Ok(self
+            .image
+            .get(offset..offset + self.size as usize)
+            .map(|bytes| vec![(pgno, bytes.to_vec())])
+            .unwrap_or_default())
     }
+}
+
+fn identity_worker() -> Worker {
+    Worker {
+        runtime_instance_id: crate::native_host::new_uuid().unwrap(),
+        deployment_id: "deployment-1".into(),
+        limits: api::ExecutionLimits {
+            cpu_ms: 1,
+            wall_ms: 5,
+            ..Default::default()
+        },
+        config: Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: String::new(),
+            script_name: "identity-worker".into(),
+            do_classes: vec![],
+            bindings: vec![],
+            r2_bindings: vec![],
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            ai_binding: None,
+            vars: vec![],
+            node: "test".into(),
+            modules: vec![],
+            compat: Compat::default(),
+        })),
+        program: Box::new(TestProgram),
+        env: json!({}),
+        cells: Default::default(),
+        live: Arc::new(()),
+    }
+}
+#[tokio::test]
+async fn native_identity_scopes_parentage_slot_reuse_and_cancellation() {
+    let mut worker = identity_worker();
+    let (reply, _receive) = tokio::sync::oneshot::channel();
+    let mut first = worker.entry(Answer::Fetch(reply), None, None, None, None);
+    let parent = first.native.as_ref().unwrap().metadata.clone();
+    let (reply, _receive) = tokio::sync::oneshot::channel();
+    let mut second = worker.entry(Answer::Fetch(reply), None, None, None, Some(parent.clone()));
+    let child = second.native.as_ref().unwrap().metadata.clone();
+    assert_ne!(parent.invocation_id, child.invocation_id);
+    assert_eq!(parent.runtime_instance_id, child.runtime_instance_id);
+    assert_eq!(child.root_invocation_id, parent.root_invocation_id);
+    assert_eq!(
+        child.parent_invocation_id.as_ref(),
+        Some(&parent.invocation_id)
+    );
+    assert_eq!(child.worker_id, "identity-worker");
+    let mut other = identity_worker();
+    let (reply, _receive) = tokio::sync::oneshot::channel();
+    let mut third = other.entry(Answer::Fetch(reply), None, None, None, Some(child));
+    assert_ne!(
+        third.native.as_ref().unwrap().metadata.runtime_instance_id,
+        parent.runtime_instance_id
+    );
+    assert!(first.remaining(Duration::from_secs(300)).unwrap() <= Duration::from_millis(5));
+    tokio::time::sleep(Duration::from_millis(6)).await;
+    assert_eq!(
+        first.remaining(Duration::from_secs(300)),
+        Some(Duration::ZERO)
+    );
+    worker.turn_cancel(&mut first);
+    worker.turn_cancel(&mut second);
+    other.turn_cancel(&mut third);
+    assert!(first.native.is_none());
+    assert!(second.native.is_none());
+    assert_eq!(Arc::strong_count(&worker.live), 1);
 }

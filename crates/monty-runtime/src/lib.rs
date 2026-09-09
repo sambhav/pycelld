@@ -1,7 +1,7 @@
 //! Native Python compilation, values, capabilities and suspended executions.
 mod exports;
-mod filesystem;
 mod extensions;
+mod filesystem;
 mod modules;
 mod network;
 mod package;
@@ -9,8 +9,8 @@ mod runtime;
 mod value;
 pub use extensions::{PythonModule, PythonResult};
 pub use monty_types::{ExcType, MontyException as PythonError, MontyObject as PythonValue};
-pub use runtime::Monty;
 pub use network::{FetchContext, FetchDecision, FetchRequest};
+pub use runtime::Monty;
 
 /// Editor definitions for the built-in Python module.
 pub const TYPES: &str = include_str!("celld.pyi");
@@ -88,26 +88,43 @@ pub(crate) struct Session {
     pending_os: Option<(monty::OsCall, filesystem::ResultType)>,
     filesystem_call: Option<celld_runtime::filesystem::FsCall>,
     calls: usize,
+    limits: celld_runtime::ExecutionLimits,
     rpc: bool,
     response: Option<value::HttpResponse>,
     extensions: std::sync::Arc<extensions::Extensions>,
 }
 impl Session {
+    #[cfg(test)]
     pub fn start(
         function: &exports::Function,
         args: &Value,
         context: &Value,
     ) -> Result<(Self, Value), Failure> {
+        Self::start_with_limits(
+            function,
+            args,
+            context,
+            celld_runtime::ExecutionLimits::default(),
+        )
+    }
+    pub fn start_with_limits(
+        function: &exports::Function,
+        args: &Value,
+        context: &Value,
+        limits: celld_runtime::ExecutionLimits,
+    ) -> Result<(Self, Value), Failure> {
+        limits.validate()?;
         let mut session = Self {
             pending: None,
             pending_os: None,
             filesystem_call: None,
             calls: 0,
+            limits,
             rpc: function.rpc,
             response: None,
             extensions: function.extensions.clone(),
         };
-        let event = session.advance(function.start(args, context)?)?;
+        let event = session.advance(function.start_with_limits(args, context, limits)?)?;
         Ok((session, event))
     }
     pub fn take_response(&mut self) -> Option<value::HttpResponse> {
@@ -131,22 +148,32 @@ impl Session {
     }
 
     pub fn take_filesystem_call(&mut self) -> Result<celld_runtime::filesystem::FsCall, Failure> {
-        self.filesystem_call.take().ok_or_else(|| "no pending filesystem call".into())
+        self.filesystem_call
+            .take()
+            .ok_or_else(|| "no pending filesystem call".into())
     }
-    pub fn resume_filesystem(&mut self, reply: celld_runtime::filesystem::FsResult) -> Result<Value, Failure> {
+    pub fn resume_filesystem(
+        &mut self,
+        reply: celld_runtime::filesystem::FsResult,
+    ) -> Result<Value, Failure> {
         let (call, result) = self.pending_os.take().ok_or("no pending OS call")?;
-        let progress = call.resume(filesystem::response(reply, result), PrintWriter::Disabled)
+        let progress = call
+            .resume(filesystem::response(reply, result), PrintWriter::Disabled)
             .map_err(Failure::python)?;
         self.advance(progress)
     }
     pub fn resume(&mut self, reply: Value) -> Result<Value, Failure> {
         if self.pending_os.is_some() {
-            let message = reply["error"].as_str().unwrap_or("filesystem host call failed");
+            let message = reply["error"]
+                .as_str()
+                .unwrap_or("filesystem host call failed");
             return self.resume_filesystem(Err(celld_runtime::filesystem::FsError::new(
-                celld_runtime::filesystem::FsErrorKind::Io, message)));
+                celld_runtime::filesystem::FsErrorKind::Io,
+                message,
+            )));
         }
         let call = self.pending.take().ok_or("session is not suspended")?;
-        if reply.to_string().len() > 1024 * 1024 {
+        if reply.to_string().len() > self.limits.max_payload_bytes {
             return Err("host result exceeds 1 MiB".into());
         }
         let reply = if let Some(error) = reply.get("error") {
@@ -179,7 +206,7 @@ impl Session {
         headers: Value,
         body: Vec<u8>,
     ) -> Result<Value, Failure> {
-        if body.len() + headers.to_string().len() > 1024 * 1024 {
+        if body.len() + headers.to_string().len() > self.limits.max_payload_bytes {
             return Err("host result exceeds 1 MiB".into());
         }
         let call = self.pending.take().ok_or("session is not suspended")?;
@@ -211,7 +238,7 @@ impl Session {
                 if let Some((arity, callback)) = self.extensions.functions.get(&call.function_name)
                 {
                     self.calls += 1;
-                    if self.calls > 10_000 {
+                    if self.calls > self.limits.max_operations {
                         return Err("host call limit exceeded".into());
                     }
                     let RunProgress::FunctionCall(mut call) = progress else {
@@ -227,7 +254,7 @@ impl Session {
                         ))
                     } else if call.args.iter().fold(0usize, |size, arg| {
                         size.saturating_add(arg.deep_host_size())
-                    }) > 1024 * 1024
+                    }) > self.limits.max_payload_bytes
                     {
                         Err(PythonError::new(
                             ExcType::ValueError,
@@ -235,7 +262,7 @@ impl Session {
                         ))
                     } else {
                         callback(std::mem::take(&mut call.args)).and_then(|value| {
-                            if value.deep_host_size() > 1024 * 1024 {
+                            if value.deep_host_size() > self.limits.max_payload_bytes {
                                 Err(PythonError::new(
                                     ExcType::ValueError,
                                     Some("native function result exceeds 1 MiB".into()),
@@ -259,8 +286,13 @@ impl Session {
             }
             if let RunProgress::OsCall(mut call) = progress {
                 self.calls += 1;
-                if self.calls > 10_000 { return Err("host call limit exceeded".into()); }
-                let operation = std::mem::replace(&mut call.function_call, monty_types::OsFunctionCall::GetEnviron);
+                if self.calls > self.limits.max_operations {
+                    return Err("host call limit exceeded".into());
+                }
+                let operation = std::mem::replace(
+                    &mut call.function_call,
+                    monty_types::OsFunctionCall::GetEnviron,
+                );
                 match filesystem::request(operation) {
                     Ok((request, result)) => {
                         self.filesystem_call = Some(request);
@@ -268,7 +300,8 @@ impl Session {
                         return Ok(json!({"done":false,"operation":"filesystem"}));
                     }
                     Err(error) => {
-                        progress = call.resume(ExtFunctionResult::Error(error), PrintWriter::Disabled)
+                        progress = call
+                            .resume(ExtFunctionResult::Error(error), PrintWriter::Disabled)
                             .map_err(Failure::python)?;
                         continue;
                     }
@@ -283,18 +316,22 @@ impl Session {
                         // have no remote value contract in this interface.
                         value::to_json(&result)?;
                         let wire = serde_json::to_string(&result).map_err(|e| e.to_string())?;
-                        if wire.len() > 1024 * 1024 {
+                        if wire.len() > self.limits.max_payload_bytes {
                             return Err("result exceeds 1 MiB".into());
                         }
                         Ok(json!({"done":true,"wire":wire}))
                     } else {
-                        self.response = Some(value::response(&result)?);
+                        let response = value::response(&result)?;
+                        if response.body.len() > self.limits.max_payload_bytes {
+                            return Err("result exceeds payload limit".into());
+                        }
+                        self.response = Some(response);
                         Ok(json!({"done":true}))
                     }
                 }
                 RunProgress::FunctionCall(call) => {
                     self.calls += 1;
-                    if self.calls > 10_000 {
+                    if self.calls > self.limits.max_operations {
                         return Err("host call limit exceeded".into());
                     }
                     if call.function_name != "_celld_host"
@@ -349,7 +386,7 @@ impl Session {
                     } else {
                         0
                     };
-                    if args.to_string().len() + body_size > 1024 * 1024 {
+                    if args.to_string().len() + body_size > self.limits.max_payload_bytes {
                         return Err("host arguments exceed 1 MiB".into());
                     }
                     let event = json!({"done":false,"operation":operation,"args":args});

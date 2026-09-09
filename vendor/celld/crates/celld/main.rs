@@ -698,6 +698,7 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
     dispatch_do_call(
         app,
         DoCallReq {
+        native_parent: None,
             request_id: None,
             cancel: None,
             deliver_abort_to_handler: false,
@@ -1012,6 +1013,7 @@ fn local_dispatch_request_id(
 
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let DoCallReq {
+        native_parent,
         request_id,
         cancel,
         deliver_abort_to_handler,
@@ -1105,6 +1107,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                                 scope.clone(),
                                 name,
                                 RuntimeFetch {
+        native_parent: native_parent.clone(),
                                     url,
                                     method,
                                     body,
@@ -1225,6 +1228,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                 );
                 {
                     let control = peer_tunnel::TunnelControl {
+        native_parent: native_parent.clone(),
                         scope: scope.clone(),
                         name: name.clone(),
                         request_id,
@@ -2012,6 +2016,7 @@ async fn dispatch_cell_fetch(
     let (reply, receive) = oneshot::channel();
     let (cancel_tx, cancel) = oneshot::channel();
     let accepted = celld::js::submit_do_call(celld::js::DoCallReq {
+        native_parent: None,
         // Named, and named here: the abort fires only for a call that carries
         // both an id and a cancel signal, so leaving this None silently costs
         // the cancellation rather than failing.
@@ -2066,6 +2071,7 @@ async fn dispatch_cell_fetch(
 
 /// One forwarded cell fetch, after transport decode.
 pub(crate) struct ForwardedFetch {
+    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
     pub(crate) name: Option<String>,
     pub(crate) url: String,
     pub(crate) method: String,
@@ -2092,6 +2098,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
     request_body: celld::js::RequestBody,
 ) -> ForwardedFetchOutcome {
     let ForwardedFetch {
+        native_parent,
         name,
         url,
         method,
@@ -2137,6 +2144,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     scope,
                     name,
                     RuntimeFetch {
+        native_parent,
                         url,
                         method,
                         body: request_body,
@@ -2584,6 +2592,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     dispatch_do_call(
         app,
         DoCallReq {
+        native_parent: None,
             request_id: None,
             cancel: None,
             deliver_abort_to_handler: false,

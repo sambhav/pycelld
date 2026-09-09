@@ -4,6 +4,8 @@ use serde_json::json;
 
 fn invocation() -> Invocation {
     Invocation {
+        execution: Default::default(),
+        limits: Default::default(),
         request: Request {
             url: "http://test/run".into(),
             method: "POST".into(),
@@ -487,7 +489,9 @@ fn synthetic_fetch_responses_preserve_bytes_and_do_not_recurse() {
         }))
         .with_fetch_middleware(|_, _| panic!("middleware after response must not run"));
     let program = runtime.compile("async def run(ctx):\n    for i in range(1000):\n        response = await ctx.fetch('https://example.com')\n        assert response.headers['x-source'] == 'middleware'\n    return response").unwrap();
-    let (_, Step::Return(response)) = program.start(invocation()).unwrap() else {
+    let mut call = invocation();
+    call.limits.cpu_ms = 1000; // This checks stack safety, not execution speed.
+    let (_, Step::Return(response)) = program.start(call).unwrap() else {
         panic!("synthetic fetch escaped to transport")
     };
     assert_eq!(response.status, 201);

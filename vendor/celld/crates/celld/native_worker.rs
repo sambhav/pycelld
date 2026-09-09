@@ -6,13 +6,14 @@ use crate::native_host::Host;
 use celld_runtime::{self as api, Failure, HostCall, HostReply, Step};
 use serde_json::{Value, json};
 
-const BODY_LIMIT: usize = 1024 * 1024;
-
 #[cfg(test)]
 #[path = "../../../../tests/native_durability.rs"]
 mod tests;
 
 pub struct Worker {
+    runtime_instance_id: String,
+    deployment_id: String,
+    limits: api::ExecutionLimits,
     config: Arc<WorkerConfig>,
     program: Box<dyn api::Program>,
     env: Value,
@@ -55,6 +56,9 @@ struct Incoming {
 }
 
 pub(super) struct Execution {
+    pub(super) metadata: api::ExecutionMetadata,
+    limits: api::ExecutionLimits,
+    operations: usize,
     session: Option<Box<dyn api::Execution>>,
     host: Host,
     input: Option<Incoming>,
@@ -62,8 +66,20 @@ pub(super) struct Execution {
     _live: Arc<()>,
 }
 
+impl Execution {
+    pub(super) fn wall_budget(&self) -> Duration {
+        Duration::from_millis(self.limits.wall_ms)
+    }
+}
+
 impl Worker {
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Self> {
+        let limits = crate::env_vars::native_limits()?;
+        let runtime_instance_id = crate::native_host::new_uuid().map_err(|e| anyhow!(e))?;
+        let deployment_id = config.deployment_id.clone().unwrap_or_else(|| {
+            use sha2::Digest;
+            format!("source:{:x}", sha2::Sha256::digest(config.src.as_bytes()))
+        });
         let program = config
             .native_program
             .get_or_init(|| {
@@ -104,6 +120,9 @@ impl Worker {
             }
         }
         Ok(Self {
+            runtime_instance_id,
+            deployment_id,
+            limits,
             program,
             config,
             env: Value::Object(env),
@@ -175,7 +194,24 @@ impl Worker {
         scope: Option<String>,
         request_id: Option<RequestId>,
         trace: Option<crate::telemetry::TraceContext>,
+        parent: Option<api::ExecutionMetadata>,
     ) -> InFlight {
+        let invocation_id = crate::native_host::new_uuid().expect("OS random source unavailable");
+        let metadata = api::ExecutionMetadata {
+            worker_id: self.config.script_name.clone(),
+            deployment_id: self.deployment_id.clone(),
+            runtime_instance_id: self.runtime_instance_id.clone(),
+            root_invocation_id: parent
+                .as_ref()
+                .map_or_else(|| invocation_id.clone(), |p| p.root_invocation_id.clone()),
+            parent_invocation_id: parent.as_ref().map(|p| p.invocation_id.clone()),
+            principal: self
+                .config
+                .verified_principal
+                .clone()
+                .or_else(|| parent.and_then(|p| p.principal)),
+            invocation_id,
+        };
         let context = IoContext::new();
         let writes_before = scope.as_deref().and_then(storage::write_position);
         context.begin_event();
@@ -204,6 +240,9 @@ impl Worker {
             trace,
             failure: None,
             native: Some(Execution {
+                metadata,
+                limits: self.limits,
+                operations: 0,
                 session: None,
                 host: Host::new(scope.clone()),
                 input: None,
@@ -243,7 +282,9 @@ impl Worker {
                 return (None, vec![]);
             }
         };
-        self.begin_fetch(url, method, body, headers, request_id, reply, None, trace)
+        self.begin_fetch(
+            url, method, body, headers, request_id, reply, None, trace, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -257,6 +298,7 @@ impl Worker {
         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
         scope: Option<String>,
         trace: Option<crate::telemetry::TraceContext>,
+        native_parent: Option<api::ExecutionMetadata>,
     ) -> (Option<InFlight>, Vec<Op>) {
         if Arc::strong_count(&self.live) > 256 {
             let _ = reply.send(Ok(response(
@@ -272,7 +314,13 @@ impl Worker {
             )));
             return (None, vec![]);
         }
-        let mut entry = self.entry(Answer::Fetch(reply), scope, request_id, trace);
+        let mut entry = self.entry(
+            Answer::Fetch(reply),
+            scope,
+            request_id,
+            trace,
+            native_parent,
+        );
         let _context = CurrentGuard::enter(entry.context.clone());
         if take_request_cancellation(request_id) {
             entry.fail_cancelled(anyhow!("The client has disconnected"));
@@ -290,7 +338,8 @@ impl Worker {
                 entry.native.as_mut().unwrap().input = Some(input);
                 match take_body_stream(id) {
                     Ok(stream) => {
-                        asyncrt::enqueue(async move { collect(stream).await });
+                        let limit = self.limits.max_payload_bytes;
+                        asyncrt::enqueue(async move { collect(stream, limit).await });
                         Ok(None)
                     }
                     Err(error) => Err(error.into()),
@@ -308,11 +357,24 @@ impl Worker {
         input: Incoming,
         body: &[u8],
     ) -> Result<Option<Step>, Failure> {
-        if body.len() > BODY_LIMIT {
+        if body.len() > self.limits.max_payload_bytes {
+            return Err(body_limit());
+        }
+        if body
+            .len()
+            .saturating_add(input.url.len())
+            .saturating_add(input.method.len())
+            .saturating_add(input.headers.iter().fold(0usize, |n, (k, v)| {
+                n.saturating_add(k.len()).saturating_add(v.len())
+            }))
+            > self.limits.max_payload_bytes
+        {
             return Err(body_limit());
         }
         let object = self.object(entry.scope.as_deref())?;
         let (session, event) = self.program.start(api::Invocation {
+            execution: entry.native.as_ref().unwrap().metadata.clone(),
+            limits: self.limits,
             request: api::Request {
                 url: input.url,
                 method: input.method,
@@ -354,6 +416,7 @@ impl Worker {
         }
         let (scope, answer, alarm) = match job {
             CellJob::Fetch {
+                native_parent,
                 scope,
                 name,
                 url,
@@ -379,6 +442,7 @@ impl Worker {
                     reply,
                     Some(scope),
                     trace,
+                    native_parent,
                 );
             }
             CellJob::Alarm {
@@ -416,11 +480,14 @@ impl Worker {
             Some(scope.clone()),
             alarm.as_ref().and_then(|(_, id)| *id),
             trace,
+            None,
         );
         entry.alarm = alarm.map(|(claim, _)| claim);
         let _context = CurrentGuard::enter(entry.context.clone());
         let result = (|| {
             let (session, event) = self.program.start(api::Invocation {
+                execution: entry.native.as_ref().unwrap().metadata.clone(),
+                limits: self.limits,
                 request: api::Request {
                     url: "http://native.internal/alarm".into(),
                     method: "POST".into(),
@@ -458,13 +525,18 @@ impl Worker {
         let result = if let Some(input) = execution.input.take() {
             match result {
                 Ok(asyncrt::OpOut::Bytes(body)) => self.http(entry, input, &body),
-                Err(error) if error == "body exceeds 1 MiB" => Err(body_limit()),
+                Err(error) if error == "body exceeds native payload limit" => Err(body_limit()),
                 Err(error) => Err(error.into()),
                 _ => Err("invalid native body result".into()),
             }
         } else {
             let session = execution.session.as_mut().expect("suspended session");
             match result {
+                Ok(asyncrt::OpOut::Native(reply))
+                    if reply.payload_bytes() > self.limits.max_payload_bytes =>
+                {
+                    Err(body_limit())
+                }
                 Ok(asyncrt::OpOut::Native(reply)) => session.resume(reply),
                 Err(error) => session.resume(HostReply::Error(error)),
                 _ => Err("invalid native operation result".into()),
@@ -489,12 +561,27 @@ impl Worker {
     fn drive(&self, entry: &mut InFlight, mut event: Step) -> Result<Option<Step>, Failure> {
         loop {
             let execution = entry.native.as_mut().expect("live invocation");
+            if entry.started.elapsed() >= Duration::from_millis(self.limits.wall_ms) {
+                return Err("native wall-time limit exceeded".into());
+            }
             let Step::Call(call) = event else {
                 if execution.host.in_transaction() {
                     return Err("unclosed transaction".into());
                 }
+                if let Step::Return(response) = &event {
+                    if response.payload_bytes() > self.limits.max_payload_bytes {
+                        return Err(body_limit());
+                    }
+                }
                 return Ok(Some(event));
             };
+            execution.operations += 1;
+            if execution.operations > self.limits.max_operations {
+                return Err("native operation limit exceeded".into());
+            }
+            if call.payload_bytes() > self.limits.max_payload_bytes {
+                return Err(body_limit());
+            }
             let reply = if Host::handles(&call) {
                 match execution.host.call(call) {
                     Ok((reply, alarm)) => {
@@ -515,6 +602,9 @@ impl Worker {
                     Err(error) => HostReply::Error(error),
                 }
             };
+            if reply.payload_bytes() > self.limits.max_payload_bytes {
+                return Err(body_limit());
+            }
             event = entry
                 .native
                 .as_mut()
@@ -575,9 +665,10 @@ impl Worker {
                     headers,
                     body,
                 } = request;
-                if body.len() > BODY_LIMIT {
-                    return Err("fetch body exceeds 1 MiB".into());
+                if body.len() > self.limits.max_payload_bytes {
+                    return Err("fetch body exceeds native payload limit".into());
                 }
+                let limit = self.limits.max_payload_bytes;
                 let future = native_fetch(
                     api::Request {
                         url,
@@ -596,11 +687,15 @@ impl Worker {
                         .iter()
                         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
                         .collect();
-                    let body =
-                        collect(Box::pin(response.bytes_stream().map(|chunk| {
-                            chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())
-                        })))
-                        .await?;
+                    let body = collect(
+                        Box::pin(
+                            response
+                                .bytes_stream()
+                                .map(|chunk| chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())),
+                        ),
+                        limit,
+                    )
+                    .await?;
                     Ok(asyncrt::OpOut::Native(HostReply::Fetch(api::Response {
                         status,
                         headers,
@@ -617,7 +712,7 @@ impl Worker {
                 if !self.program.classes().contains(class) {
                     return Err("unknown durable class".into());
                 }
-                if body.len() > BODY_LIMIT {
+                if body.len() > self.limits.max_payload_bytes {
                     return Err("object arguments exceed 1 MiB".into());
                 }
                 let name = object.id;
@@ -642,6 +737,7 @@ impl Worker {
                 let (reply, receive) = tokio::sync::oneshot::channel();
                 let body = RequestBody::Bytes(body.into());
                 let request = DoCallReq {
+                    native_parent: Some(entry.native.as_ref().unwrap().metadata.clone()),
                     request_id: Some(request_id),
                     cancel: Some(cancel),
                     deliver_abort_to_handler: false,
@@ -656,6 +752,7 @@ impl Worker {
                     order,
                     parent: entry.trace,
                 };
+                let limit = self.limits.max_payload_bytes;
                 asyncrt::enqueue(async move {
                     gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
                     let response = receive
@@ -663,7 +760,7 @@ impl Worker {
                         .map_err(|_| "durable call dropped".to_string())?
                         .map_err(|e| e.to_string())?;
                     cancel_guard.disarm();
-                    if response.body.len() > BODY_LIMIT {
+                    if response.body.len() > limit {
                         return Err("object result exceeds 1 MiB".into());
                     }
                     Ok(asyncrt::OpOut::Native(HostReply::Object(api::Response {
@@ -749,7 +846,7 @@ fn body_limit() -> Failure {
     Failure {
         status: 413,
         code: "body_too_large".into(),
-        message: "body exceeds 1 MiB".into(),
+        message: "body exceeds native payload limit".into(),
     }
 }
 fn response(
@@ -838,12 +935,12 @@ fn native_fetch(
         result
     }
 }
-async fn collect(mut stream: HttpChunkStream) -> Result<Vec<u8>, String> {
+async fn collect(mut stream: HttpChunkStream, limit: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        if chunk.len() > BODY_LIMIT - body.len() {
-            return Err("body exceeds 1 MiB".into());
+        if chunk.len() > limit - body.len() {
+            return Err("body exceeds native payload limit".into());
         }
         body.extend_from_slice(&chunk);
     }
