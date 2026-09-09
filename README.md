@@ -71,7 +71,9 @@ Durable objects can use [`pathlib.Path` and `open()`](docs/filesystem.md) for
 persistent files and folders. Each object has a private root backed by its
 SQLite database, sharing storage transactions and recovery.
 
-Outbound HTTP is denied by default. Embedding hosts can install
+Outbound HTTP is denied by default. The supplied binary can load an operator-owned
+[Python network policy](docs/network-policy.md) using `CELLD_PYTHON_NETWORK_POLICY`.
+Embedding hosts can install
 [fetch middleware](docs/extensions.md#outbound-http-middleware) to approve,
 rewrite, answer or deny calls without a JavaScript bridge.
 

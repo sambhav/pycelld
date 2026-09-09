@@ -7,7 +7,7 @@
 pub use celld;
 pub use celld_monty::{
     ExcType, FetchContext, FetchDecision, FetchRequest, Monty, PythonError, PythonModule,
-    PythonResult, PythonValue,
+    PythonNetworkPolicy, PythonResult, PythonValue,
 };
 pub use celld_runtime as runtime;
 

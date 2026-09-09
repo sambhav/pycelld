@@ -66,7 +66,7 @@ impl Network {
     }
 }
 
-fn validate(request: &FetchRequest) -> Result<(), &'static str> {
+pub(crate) fn validate(request: &FetchRequest) -> Result<(), &'static str> {
     if !matches!(request.url.scheme(), "http" | "https") || request.url.host().is_none() {
         return Err("fetch requires an absolute HTTP(S) URL");
     }
