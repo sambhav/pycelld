@@ -56,8 +56,13 @@ class Alarms:
         _celld_host("storage.delete_alarm")
 
 
+def http(handler):
+    """Declare the exported catchall HTTP handler (recognized at compile time)."""
+    return handler
+
+
 class Response:
-    def __init__(self, body: str | bytes = "", *, status: int = 200, headers: dict[str, str] | None = None):
+    def __init__(self, body: str | bytes = "", *, status: int = 200, headers: dict[str, str] | list[tuple[str, str]] | None = None):
         self.body = body
         self.status = status
         self.headers = headers or {}
@@ -74,6 +79,23 @@ class Request:
         self.method = metadata.get("method", "POST")
         self.url = metadata.get("url", "")
         self.headers = metadata.get("headers", {})
+        self.header_items = [(key, value) for key, value in metadata.get("header_items", list(self.headers.items()))]
+        self.path = metadata.get("path", "")
+        self.query_items = [(key, value) for key, value in metadata.get("query_items", [])]
+        self.query = dict(self.query_items)
+        self.body = b""
+
+    def text(self) -> str:
+        return self.body.decode("utf-8")
+
+    def json(self) -> Json:
+        return _celld_json.loads(self.text())
+
+    def get_all_headers(self, name: str) -> list[str]:
+        return [value for key, value in self.header_items if key.lower() == name.lower()]
+
+    def get_all_query(self, name: str) -> list[str]:
+        return [value for key, value in self.query_items if key == name]
 
 
 class ExecutionMetadata:

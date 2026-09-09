@@ -751,3 +751,23 @@ fn span_records_caught_errors_and_public_error_messages_are_opt_in() {
         matches!(&events.lock().unwrap()[0], Diagnostic::Span {name, ok:false,..} if name == "failed")
     );
 }
+
+#[test]
+fn package_can_reexport_one_http_handler() {
+    assert_eq!(Monty::new().descriptor().required_feature, "monty-http-v1");
+    assert!(Monty::new().supported_features().contains(&"monty-http-v1"));
+    let source = package("app", &[
+        ("app", true, "from .handlers import handle as endpoint\n__all__ = ['endpoint']"),
+        ("app.handlers", false, "from celld import http\n@http\ndef handle(request): return request.path\ndef helper(): return 'private'"),
+    ]);
+    let program = Monty::new().compile(&source).unwrap();
+    let (_, step) = program.start(Invocation {
+        request: Request { url: "http://test/v1/nested".into(), method: "GET".into(), headers: vec![], body: vec![] },
+        object: None, alarm: false, env: json!({}),
+        execution: Default::default(), limits: Default::default(), observer: None,
+    }).unwrap();
+    let Step::Return(response) = step else { panic!("unexpected host call") };
+    assert_eq!(response.body, b"/v1/nested");
+    let duplicate = source.replace("__all__ = ['endpoint']", "from .handlers import handle\\n__all__ = ['endpoint', 'handle']");
+    assert!(Monty::new().compile(&duplicate).is_err());
+}

@@ -5,6 +5,7 @@ python3 -m unittest discover -s tools -p test_release.py -v
 cargo xtask test
 cargo xtask build
 python3 tools/monty-checks/e2e.py target/lab/celld
+python3 tools/monty-checks/http_handlers.py target/lab/celld
 python3 tools/monty-checks/consumer.py
 python3 tools/storage-checks/probe.py target/lab/celld -v
 ```

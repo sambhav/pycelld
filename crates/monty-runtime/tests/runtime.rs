@@ -354,3 +354,104 @@ fn filesystem_text_decode_errors_keep_python_type_and_message() {
     session.resume_filesystem(Ok(FsReply::Bytes(vec![b'a', 255]))).unwrap();
     assert!(body(&mut session).contains("invalid start byte"));
 }
+
+#[test]
+fn explicit_http_dispatch_and_buffered_request() {
+    use celld_runtime::{Invocation, Request, Runtime, Step};
+    let program = crate::Monty::new().compile(r#"
+from celld import http, Request, Response
+@http
+async def handle(request: Request, ctx):
+    assert request is ctx.request
+    if request.path == '/json':
+        try:
+            return request.json()
+        except ValueError:
+            return Response('invalid JSON', status=400)
+    if request.path == '/binary':
+        return Response(request.body, status=201, headers=[('Set-Cookie', 'a=1'), ('Set-Cookie', 'b=2')])
+    return {'method': request.method, 'path': request.path, 'text': request.text(),
+            'query': request.query, 'tags': request.get_all_query('tag'),
+            'headers': request.get_all_headers('X-Test')}
+def hello(name: str = 'world'): return name
+def _helper(): return 'private'
+"#).unwrap();
+    let invoke = |method: &str, path: &str, body: &[u8]| {
+        let (_, step) = program
+            .start(Invocation {
+                request: Request {
+                    url: format!("http://test{path}"),
+                    method: method.into(),
+                    headers: vec![("X-Test".into(), "a".into()), ("x-test".into(), "b".into())],
+                    body: body.to_vec(),
+                },
+                object: None,
+                alarm: false,
+                env: json!({}),
+                execution: Default::default(), limits: Default::default(), observer: None,
+            })
+            .unwrap();
+        let Step::Return(response) = step else {
+            panic!("unexpected host call")
+        };
+        response
+    };
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        let response = invoke(method, "/v1/items?tag=one&tag=two&name=a+b", b"hello");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap(),
+            json!({
+            "method":method, "path":"/v1/items", "text":"hello", "query":{"tag":"two","name":"a b"},
+            "tags":["one","two"], "headers":["a","b"]})
+        );
+    }
+    let binary = invoke("PUT", "/binary", b"\x00\xff");
+    assert_eq!(binary.status, 201);
+    assert_eq!(binary.body, b"\x00\xff");
+    assert_eq!(
+        binary.headers,
+        vec![
+            ("set-cookie".into(), "a=1".into()),
+            ("set-cookie".into(), "b=2".into())
+        ]
+    );
+    assert_eq!(invoke("POST", "/json", b"{").status, 400);
+    assert_eq!(invoke("POST", "/json", b"[1,2]").body, b"[1,2]");
+    assert_eq!(invoke("POST", "/hello", b"{}").body, b"world");
+    assert_eq!(invoke("GET", "/hello", b"").status, 405);
+    // Decorated and private functions are not public-function endpoints.
+    assert!(
+        serde_json::from_slice::<Value>(&invoke("POST", "/handle", b"raw").body)
+            .unwrap()
+            .is_object()
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&invoke("POST", "/_helper", b"raw").body)
+            .unwrap()
+            .is_object()
+    );
+}
+
+#[test]
+fn http_handler_declarations_are_unambiguous() {
+    for source in [
+        "from celld import http\n@http\ndef handle(): pass",
+        "from celld import http\n@http\ndef handle(request, extra): pass",
+        "from celld import http\n@http\ndef handle(request=None): pass",
+        "from celld import http\n@http\ndef one(request): pass\n@http\ndef two(request): pass",
+        "def http(f): return f\n@http\ndef handle(request): pass",
+        "from celld import http\n@http()\ndef handle(request): pass",
+    ] {
+        assert!(Module::compile(source).is_err(), "{source}");
+    }
+    for source in [
+        "from celld import http as endpoint\n@endpoint\ndef handle(request): return request.method",
+        "import celld as c\n@c.http\ndef handle(request): return request.method",
+    ] {
+        let module = Module::compile(source).unwrap();
+        assert!(module.http().is_some());
+        assert!(module.get("handle").is_none());
+    }
+    let module = Module::compile("from celld import http\n__all__=['hello']\n@http\ndef handle(request): pass\ndef hello(): pass").unwrap();
+    assert!(module.http().is_none());
+}

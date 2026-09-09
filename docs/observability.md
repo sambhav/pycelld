@@ -89,4 +89,5 @@ logs retain structured JSON bodies and custom spans have an optional `attributes
 JSON column. OTLP additionally promotes execution IDs to `celld.*` log attributes
 and exports custom-span metadata as `python.attributes`.
 
-Deployments require `monty-observability-v1`; older artifacts continue to load.
+The host advertises `monty-observability-v1`; see [builds](build.md) for the current
+deployment requirement. Older artifacts continue to load.

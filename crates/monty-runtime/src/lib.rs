@@ -107,6 +107,7 @@ impl Session {
             function,
             args,
             context,
+            &[],
             celld_runtime::ExecutionLimits::default(),
             None,
         )
@@ -115,6 +116,7 @@ impl Session {
         function: &exports::Function,
         args: &Value,
         context: &Value,
+        body: &[u8],
         limits: celld_runtime::ExecutionLimits,
         observer: Option<std::sync::Arc<dyn celld_runtime::observability::Observer>>,
     ) -> Result<(Self, Value), Failure> {
@@ -130,7 +132,7 @@ impl Session {
             response: None,
             extensions: function.extensions.clone(),
         };
-        let progress = function.start_with_limits(args, context, limits, &mut session.output)?;
+        let progress = function.start_with_limits(args, context, body, limits, &mut session.output)?;
         let event = session.advance(progress)?;
         Ok((session, event))
     }

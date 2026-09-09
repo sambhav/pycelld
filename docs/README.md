@@ -1,6 +1,7 @@
 # Documentation
 
 - [Python handlers, context, and durable objects](python.md)
+- [HTTP routing, webhooks, and binary bodies](http.md)
 - [Import pycelld and add Monty functions and classes](extensions.md)
 - [Building, the Rust runtime API, and maintaining upstream patches](build.md)
 - [Tests and benchmarks](testing.md)

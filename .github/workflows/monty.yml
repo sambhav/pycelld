@@ -33,6 +33,7 @@ jobs:
       - run: python -m unittest discover -s tools -p test_release.py -v
       - run: python -m unittest discover -s tools/linux-checks -v
       - run: MYPYPATH=crates/monty-runtime/src mypy --strict examples/monty/worker.py
+      - run: MYPYPATH=crates/monty-runtime/src mypy --strict examples/http/worker.py
       - run: MYPYPATH=crates/monty-runtime/src mypy --strict tools/monty-checks/bench/worker.py
       - run: cargo xtask test
       - run: cargo xtask build
@@ -46,4 +47,5 @@ jobs:
             target
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - run: python tools/monty-checks/e2e.py target/lab/celld
+      - run: python tools/monty-checks/http_handlers.py target/lab/celld
       - run: python tools/monty-checks/consumer.py

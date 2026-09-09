@@ -160,12 +160,6 @@ pub fn response(value: &M) -> Result<HttpResponse, String> {
                 return Err("response body must be str or bytes".into());
             }
             let headers = to_json(fields.get("headers").ok_or("missing response headers")?)?;
-            if !headers
-                .as_object()
-                .is_some_and(|h| h.values().all(Value::is_string))
-            {
-                return Err("response headers must be dict[str, str]".into());
-            }
             (
                 *status,
                 headers,
@@ -188,8 +182,28 @@ pub fn response(value: &M) -> Result<HttpResponse, String> {
             false,
         ),
     };
-    let mut normalized = serde_json::Map::new();
-    for (name, value) in headers.as_object().ok_or("invalid headers")? {
+    let pairs: Vec<(String, Value)> = match headers {
+        Value::Object(values) => values.into_iter().collect(),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|v| {
+                let pair = v
+                    .as_array()
+                    .filter(|p| p.len() == 2)
+                    .ok_or("response headers must contain name/value pairs")?;
+                Ok((
+                    pair[0]
+                        .as_str()
+                        .ok_or("response header name must be str")?
+                        .to_owned(),
+                    pair[1].clone(),
+                ))
+            })
+            .collect::<Result<_, String>>()?,
+        _ => return Err("response headers must be dict[str, str] or list[tuple[str, str]]".into()),
+    };
+    let mut normalized = Vec::new();
+    for (name, value) in pairs {
         if name.is_empty()
             || !name
                 .bytes()
@@ -200,7 +214,7 @@ pub fn response(value: &M) -> Result<HttpResponse, String> {
         let value = value
             .as_str()
             .ok_or("response header value must be str")?
-            .trim_matches(['\t', '\n', '\r', ' ']);
+            .trim_matches(['\t', ' ']);
         if value
             .chars()
             .any(|c| matches!(c, '\0' | '\r' | '\n') || c as u32 > 255)
@@ -208,34 +222,20 @@ pub fn response(value: &M) -> Result<HttpResponse, String> {
             return Err("invalid response header value".into());
         }
         let name = name.to_ascii_lowercase();
-        match normalized.get_mut(&name) {
-            Some(Value::String(previous)) => {
-                previous.push_str(", ");
-                previous.push_str(value);
-            }
-            _ => {
-                normalized.insert(name, json!(value));
-            }
-        }
+        normalized.push((name, value.to_owned()));
     }
-    if text && !normalized.contains_key("content-type") {
-        normalized.insert("content-type".into(), json!("text/plain;charset=UTF-8"));
+    if text && !normalized.iter().any(|(name, _)| name == "content-type") {
+        normalized.push(("content-type".into(), "text/plain;charset=UTF-8".into()));
     }
     let body_size = body.len();
-    let header_size: usize = normalized
-        .iter()
-        .map(|(k, v)| k.len() + v.as_str().unwrap().len())
-        .sum();
+    let header_size: usize = normalized.iter().map(|(k, v)| k.len() + v.len()).sum();
     if body_size + header_size > 1024 * 1024 {
         return Err("result exceeds 1 MiB".into());
     }
     Ok(HttpResponse {
         status: status as u16,
         body,
-        headers: normalized
-            .into_iter()
-            .map(|(k, v)| (k, v.as_str().unwrap().to_owned()))
-            .collect(),
+        headers: normalized,
     })
 }
 

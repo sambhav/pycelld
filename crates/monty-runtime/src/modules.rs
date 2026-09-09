@@ -206,6 +206,25 @@ impl Graph {
             source_lines: BTreeMap::new(),
         })
     }
+    /// Only the imported celld marker is special; similarly named user decorators are not.
+    pub fn is_http_decorator(&self, module: &str, expr: &Expr) -> Result<bool> {
+        let symbols = bindings(module, &self.modules[module])?;
+        Ok(match expr {
+            Expr::Name(n) => {
+                matches!(symbols.get(n.id.as_str()), Some(Binding::From(m, n)) if m == "celld" && n == "http")
+            }
+            Expr::Attribute(a) if a.attr.as_str() == "http" => {
+                if let Expr::Name(n) = a.value.as_ref() {
+                    let parsed = ruff_python_parser::parse_module(&self.modules[module].source)
+                        .map_err(|e| e.to_string())?;
+                    matches!(symbols.get(n.id.as_str()), Some(Binding::Module)) && parsed.syntax().body.iter().any(|s| matches!(s, Stmt::Import(i) if i.names.iter().any(|a| a.name.as_str() == "celld" && a.asname.as_ref().map_or("celld", |n| n.as_str()) == n.id.as_str())))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        })
+    }
     pub fn target(&self, module: &str, name: &str) -> String {
         format!("_celld_m{}.{}", self.indices[module], name)
     }
@@ -600,7 +619,15 @@ impl<'a> Visitor<'a> for Rewrite<'_> {
         match stmt {
             Stmt::FunctionDef(f) => {
                 for d in &f.decorator_list {
-                    self.visit_decorator(d);
+                    match self.graph.is_http_decorator(self.module, &d.expression) {
+                        Ok(true) => self.replace(
+                            d.range.start().to_usize(),
+                            d.range.end().to_usize(),
+                            String::new(),
+                        ),
+                        Ok(false) => self.visit_decorator(d),
+                        Err(error) => self.error = Some(error),
+                    }
                 }
                 self.visit_parameters(&f.parameters);
                 if let Some(r) = &f.returns {
