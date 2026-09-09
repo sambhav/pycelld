@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycelld"
+version = "0.4.1"
+description = "Install, check and test native Python workers with celld"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+pycelld = "pycelld.cli:main"
+
+[project.entry-points.pytest11]
+"pycelld.pytest_plugin" = "pycelld.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["pycelld*"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

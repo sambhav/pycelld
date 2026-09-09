@@ -10,6 +10,27 @@ patches reproduce the included host sources from celld 0.4.1.
 
 ## Build and run
 
+Python developers can install the CLI and pytest fixtures using Python and Git,
+without Rust:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install 'pycelld[test] @ git+https://github.com/sambhav/pycelld.git'
+pycelld install
+pycelld init hello
+pycelld dev hello
+# In another terminal with the same environment:
+pycelld check hello
+python -m pytest hello/tests
+```
+
+Python 3.12+ runs the development tools; workers run in Monty's Python subset.
+`install` verifies a published binary and generates its matching editor types.
+Pin a binary with `pycelld install --version 0.4.1-pycelld.4`, or select an existing
+host with `PYCELLD_BINARY=/path/to/celld`. See the [Python tooling guide](docs/tooling.md)
+and [durable API integration example](examples/python-api).
+
 [Download celld binaries](https://github.com/sambhav/pycelld/releases/latest) for Linux
 and macOS, on x86-64 and ARM64. Linux binaries require glibc 2.28 or later. Every push to `main` automatically publishes a
 tested release such as `0.4.1-pycelld.4`: upstream celld version plus an increasing

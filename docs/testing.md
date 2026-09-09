@@ -1,5 +1,11 @@
 # Validation
 
+Application authors can use the [Python tooling and pytest fixtures](tooling.md)
+with a downloaded binary. `celld_worker` runs the actual runtime with isolated
+state and controlled restart; `fetch_server` records real loopback requests;
+`wait_until` polls real alarms with a deadline. No simulated Monty/storage/clock
+implementation is involved.
+
 ```sh
 python3 -m unittest discover -s tools -p test_release.py -v
 cargo xtask test
@@ -8,7 +14,16 @@ python3 tools/monty-checks/e2e.py target/lab/celld
 python3 tools/monty-checks/http_handlers.py target/lab/celld
 python3 tools/monty-checks/consumer.py
 python3 tools/storage-checks/probe.py target/lab/celld -v
+python3 -m pip install '.[test]'
+python3 -m pytest python/tests examples/python-api/tests --celld-binary target/lab/celld -q
 ```
+
+Without `--celld-binary`/`PYCELLD_BINARY`, Python unit checks still run and native
+process tests explicitly skip. CI always supplies the freshly built executable.
+The release matrix exercises installer validation, matching types, project
+initialization, compatibility preflight and pytest/restart on all four supported
+platforms. The local installer fixture supplies real release-shaped bytes from
+the built executable; it does not depend on a release having been published yet.
 
 `cargo xtask test` covers the standalone Monty interpreter and typed runtime
 boundary, a second runtime using the public extension API, native worker

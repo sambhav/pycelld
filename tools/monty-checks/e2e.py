@@ -12,6 +12,11 @@ import sys
 import tempfile
 import time
 
+# The public pytest fixture and this broader protocol suite share one real
+# process lifecycle, including isolated copies, restart and cleanup.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
+from pycelld.testing import Worker
+
 binary = str(Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
@@ -149,13 +154,12 @@ def stateless_files():
     write_source(text)
     config = {"name":"monty-e2e", "main":"worker.py", "vars":{"GREETING":"hi"}}
     (project / "wrangler.jsonc").write_text(json.dumps(config))
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1",0))
-        port = sock.getsockname()[1]
-    url = f"http://127.0.0.1:{port}"
-    env = {k:v for k,v in os.environ.items() if not k.startswith("CELLD_")}
-    env.update(CELLD_MAX_STATELESS_ISOLATES="2")
-    log_path = root / "server.log"
+    worker = Worker(project, binary=binary)
+    project = worker.project
+    source = project / "worker.py"
+    port = worker.port
+    url = worker.url
+    log_path = worker.log_path
     def request(name, args=None):
         return Request(url+"/"+name, data=json.dumps(args or {}).encode(), headers={"content-type":"application/json"})
     def call(name, args=None, *, during_reload=False):
@@ -171,18 +175,10 @@ def stateless_files():
                 return None
             raise AssertionError(f"{name}: {error.code}: {body}") from error
     def start(log):
-        process = subprocess.Popen([binary,"dev",str(project),"--port",str(port),"--logs"],env=env,stdout=log,stderr=log)
-        deadline = time.monotonic()+120
-        while time.monotonic()<deadline:
-            if process.poll() is not None: raise AssertionError(log_path.read_text())
-            try:
-                with socket.create_connection(("127.0.0.1",port),timeout=.2): return process
-            except OSError: time.sleep(.1)
-        process.kill(); process.wait(); raise AssertionError(log_path.read_text())
+        worker.start()
+        return worker.process
     def stop(process):
-        process.terminate()
-        try: process.wait(timeout=15)
-        except subprocess.TimeoutExpired: process.kill(); process.wait()
+        worker.stop()
     process = None
     with log_path.open("w") as log:
         try:
@@ -293,4 +289,4 @@ def stateless_files():
             print(log_path.read_text(),file=sys.stderr)
             raise
         finally:
-            if process is not None: stop(process)
+            worker.close()
