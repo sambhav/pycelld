@@ -71,5 +71,5 @@ memory quota. Trusted synchronous Rust extensions and middleware must remain
 bounded and nonblocking; they cannot be preempted by Monty's interpreter timer.
 CPU accounting excludes time suspended in the host. Host wall deadlines cancel
 pending I/O, and an execution dropped by an embedding caller is cancelled.
-New deployments require `monty-execution-v1`; older artifacts still load with the
-host's configured limits.
+The host advertises `monty-execution-v1`; see [builds](build.md) for the current
+deployment requirement. Older artifacts still load with the host's configured limits.

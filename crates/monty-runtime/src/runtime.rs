@@ -30,7 +30,7 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-observability-v1",
+    required_feature: "monty-http-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
@@ -44,6 +44,7 @@ impl api::Runtime for Monty {
             "monty-filesystem-v1",
             "monty-execution-v1",
             "monty-observability-v1",
+            "monty-http-v1",
         ]
     }
     fn types(&self) -> &str {
@@ -171,13 +172,24 @@ impl Program {
         let url =
             url::Url::parse(&input.url).map_err(|_| Failure::arguments("invalid request URL"))?;
         let path = url.path().strip_prefix('/').unwrap_or("");
-        let name = percent_encoding::percent_decode_str(path)
-            .decode_utf8()
-            .map_err(|_| Failure::arguments("invalid handler name"))?;
-        if !call.alarm {
+        let name = match percent_encoding::percent_decode_str(path).decode_utf8() {
+            Ok(name) => name,
+            Err(_) if call.object.is_none() && self.http.http().is_some() => std::borrow::Cow::Borrowed(""),
+            Err(_) => return Err(Failure::arguments("invalid handler name")),
+        };
+        // An exact public function path is reserved, including its POST-only contract.
+        // All other stateless requests go to the explicitly exported HTTP handler.
+        let function_route =
+            !path.contains('/') && !name.starts_with('_') && self.http.get(&name).is_some();
+        let http = if call.object.is_none() && !function_route {
+            self.http.http()
+        } else {
+            None
+        };
+        if !call.alarm && http.is_none() {
             if path.contains('/')
                 || name.starts_with('_')
-                || (call.object.is_none() && self.http.get(&name).is_none())
+                || (call.object.is_none() && !function_route)
             {
                 return complete(text_response(404, "unknown handler", vec![]));
             }
@@ -189,12 +201,13 @@ impl Program {
                 ));
             }
         }
-        let args: Value = if input.body.is_empty() {
+        let args: Value = if http.is_some() || input.body.is_empty() {
             json!({})
         } else {
             serde_json::from_slice(&input.body)
                 .map_err(|_| Failure::arguments("request body must be a UTF-8 JSON object"))?
         };
+        let request_body = if call.object.is_none() { input.body.as_slice() } else { &[] };
         let (function, args, mut metadata) = if let Some(object) = call.object {
             if !call.alarm && name == "alarm" {
                 return Err("alarm is dispatched by the host".into());
@@ -225,17 +238,19 @@ impl Program {
                 json!({"id":object.id,"env":call.env,"request":if call.alarm { json!({}) } else { args["request"].clone() }}),
             )
         } else {
-            let function = self.http.get(&name).ok_or("unknown handler")?;
+            let function = http
+                .or_else(|| self.http.get(&name))
+                .ok_or("unknown handler")?;
             (
                 function,
                 args,
-                json!({"id":null,"env":call.env,"request":{"url":input.url,"method":input.method,"headers":headers_object(input.headers)}}),
+                json!({"id":null,"env":call.env,"request":{"url":input.url,"method":input.method,"headers":headers_object(input.headers.clone()),"header_items":input.headers,"path":url.path(),"query_items":url.query_pairs().collect::<Vec<_>>()}}),
             )
         };
         metadata["execution"] = serde_json::to_value(&call.execution).map_err(|e| e.to_string())?;
         metadata["limits"] = serde_json::to_value(call.limits).map_err(|e| e.to_string())?;
         let (session, event) =
-            Session::start_with_limits(function, &args, &metadata, call.limits, call.observer)?;
+            Session::start_with_limits(function, &args, &metadata, request_body, call.limits, call.observer)?;
         let mut execution = Execution {
             session: Some(session),
             network: self.network.clone(),

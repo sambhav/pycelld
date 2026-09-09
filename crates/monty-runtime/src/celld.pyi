@@ -2,7 +2,7 @@
 import builtins
 from datetime import datetime, timedelta
 from types import TracebackType
-from typing import TypeAlias
+from typing import Callable, TypeAlias, TypeVar
 
 Json: TypeAlias = None | bool | int | float | str | list["Json"] | dict[str, "Json"]
 SqlValue: TypeAlias = None | bool | int | float | str
@@ -26,16 +26,28 @@ class Alarms:
     def set(self, when: datetime | timedelta) -> None: ...
     def delete(self) -> None: ...
 
+_Handler = TypeVar("_Handler", bound=Callable[..., object])
+def http(handler: _Handler) -> _Handler: ...
+
 class Request:
     method: str
     url: str
     headers: dict[str, str]
+    header_items: list[tuple[str, str]]
+    path: str
+    query: dict[str, str]
+    query_items: list[tuple[str, str]]
+    body: bytes
+    def text(self) -> str: ...
+    def json(self) -> Json: ...
+    def get_all_headers(self, name: str) -> list[str]: ...
+    def get_all_query(self, name: str) -> list[str]: ...
 
 class Response:
     body: str | bytes
     status: int
-    headers: dict[str, str]
-    def __init__(self, body: str | bytes = "", *, status: int = 200, headers: dict[str, str] | None = None) -> None: ...
+    headers: dict[str, str] | list[tuple[str, str]]
+    def __init__(self, body: str | bytes = "", *, status: int = 200, headers: dict[str, str] | list[tuple[str, str]] | None = None) -> None: ...
     def text(self) -> str: ...
     def json(self) -> Json: ...
 

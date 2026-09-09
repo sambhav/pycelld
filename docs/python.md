@@ -38,6 +38,9 @@ cannot supply `ctx`. Empty bodies mean `{}`. A literal `__all__` can restrict
 exports. Functions re-exported from project modules are supported; imported host
 functions and private names are never handlers.
 
+For arbitrary methods, nested paths, webhooks and binary bodies, export an
+[explicit HTTP handler](http.md) with `@http`. Public-function endpoints can coexist.
+
 ## Packages
 
 A worker can export a whole package:

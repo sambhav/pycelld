@@ -94,6 +94,7 @@ impl Function {
         &self,
         args: &Value,
         context: &Value,
+        body: &[u8],
         limits: celld_runtime::ExecutionLimits,
         output: &mut crate::observability::Output,
     ) -> Result<RunProgress, crate::Failure> {
@@ -132,6 +133,7 @@ impl Function {
         let mut inputs = vec![
             crate::value::from_json(&Value::Object(args.clone())),
             crate::value::from_json(context),
+            MontyObject::Bytes(body.to_vec()),
             MontyObject::Function {
                 name: "_celld_host".into(),
                 docstring: None,
@@ -160,6 +162,7 @@ impl Function {
 #[derive(Clone)]
 pub struct Module {
     functions: BTreeMap<String, Function>,
+    http: Option<Function>,
 }
 pub(crate) struct Compilation {
     pub graph: crate::modules::Graph,
@@ -307,7 +310,14 @@ impl Module {
         let (prefix, sources) = graph.render_mapped(entry)?;
         let sources = Arc::new(sources);
         let mut functions = BTreeMap::new();
+        let mut http = None;
         for (name, module, f) in selected {
+            let is_http = class.is_none()
+                && f.decorator_list.len() == 1
+                && graph.is_http_decorator(&module, &f.decorator_list[0].expression)?;
+            if is_http && http.is_some() {
+                return Err("export exactly one @http handler".into());
+            }
             if !f.parameters.posonlyargs.is_empty()
                 || f.parameters.vararg.is_some()
                 || f.parameters.kwarg.is_some()
@@ -326,6 +336,12 @@ impl Module {
             {
                 let pname = p.parameter.name.to_string();
                 if class.is_some() && pname == "self" {
+                    continue;
+                }
+                if is_http && pname == "request" {
+                    if p.default.is_some() {
+                        return Err("@http request cannot have a default".into());
+                    }
                     continue;
                 }
                 if pname == "ctx" {
@@ -357,20 +373,38 @@ impl Module {
             {
                 return Err(format!("{name}: class methods must take self"));
             }
-            if !f.decorator_list.is_empty() {
+            if !f.decorator_list.is_empty() && !is_http {
                 return Err(format!(
                     "{name}: method/function decorators are not supported in Monty"
                 ));
             }
 
+            if is_http
+                && (!parameters.is_empty()
+                    || !f
+                        .parameters
+                        .args
+                        .iter()
+                        .chain(f.parameters.kwonlyargs.iter())
+                        .any(|p| p.parameter.name.as_str() == "request"))
+            {
+                return Err(
+                    "@http handlers take request: Request and optionally ctx: Context".into(),
+                );
+            }
             let target = class.map_or_else(
                 || graph.target(&module, &f.name),
                 |_| format!("_celld_instance.{name}"),
             );
             let call = format!(
-                "{}{}({}**_celld_args)",
+                "{}{}({}{}**_celld_args)",
                 if f.is_async { "await " } else { "" },
                 target,
+                if is_http {
+                    "request=_celld_context.request, "
+                } else {
+                    ""
+                },
                 if context_parameter {
                     "ctx=_celld_context, "
                 } else {
@@ -378,8 +412,8 @@ impl Module {
                 }
             );
             let construction = class.map_or_else(String::new, |(module, class)| format!("_celld_import({module:?})\n_celld_instance = {}(id=_celld_context.id, ctx=_celld_context)\n_celld_instance.id = _celld_context.id", graph.target(module, &format!("_celld_impl_{class}"))));
-            let context = if context_parameter || class.is_some() {
-                "_celld_context = _celld_import('celld').Context(_celld_metadata)"
+            let context = if context_parameter || class.is_some() || is_http {
+                "_celld_context = _celld_import('celld').Context(_celld_metadata)\n_celld_context.request.body = _celld_request_body"
             } else {
                 ""
             };
@@ -390,6 +424,7 @@ impl Module {
                 vec![
                     "_celld_args".into(),
                     "_celld_metadata".into(),
+                    "_celld_request_body".into(),
                     "_celld_host".into(),
                 ]
                 .into_iter()
@@ -398,18 +433,23 @@ impl Module {
                 CompileOptions::default(),
             )
             .map_err(|e| e.to_string())?;
-            functions.insert(
-                name,
-                Function {
-                    runner,
-                    sources: sources.clone(),
-                    rpc: class.is_some(),
-                    parameters,
-                    extensions: extensions.clone(),
-                },
-            );
+            let function = Function {
+                runner,
+                sources: sources.clone(),
+                rpc: class.is_some(),
+                parameters,
+                extensions: extensions.clone(),
+            };
+            if is_http {
+                http = Some(function);
+            } else {
+                functions.insert(name, function);
+            }
         }
-        Ok(Self { functions })
+        Ok(Self { functions, http })
+    }
+    pub(crate) fn http(&self) -> Option<&Function> {
+        self.http.as_ref()
     }
     pub fn get(&self, name: &str) -> Option<&Function> {
         self.functions.get(name)
