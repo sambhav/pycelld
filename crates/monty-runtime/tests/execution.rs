@@ -6,6 +6,7 @@ use serde_json::json;
 
 fn invocation(limits: ExecutionLimits) -> Invocation {
     Invocation {
+        observer: None,
         execution: ExecutionMetadata {
             worker_id: "trusted-worker".into(),
             deployment_id: "version-1".into(),

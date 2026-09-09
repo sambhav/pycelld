@@ -12,10 +12,16 @@ use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct Monty {
+    expose_errors: bool,
     pub(crate) network: crate::network::Network,
     pub(crate) extensions: Arc<crate::extensions::Extensions>,
 }
 impl Monty {
+    /// Include exception messages in HTTP responses (off by default).
+    pub fn with_public_errors(mut self, enabled: bool) -> Self {
+        self.expose_errors = enabled;
+        self
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -24,7 +30,7 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-execution-v1",
+    required_feature: "monty-observability-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
@@ -37,6 +43,7 @@ impl api::Runtime for Monty {
             "monty-network-policy-v1",
             "monty-filesystem-v1",
             "monty-execution-v1",
+            "monty-observability-v1",
         ]
     }
     fn types(&self) -> &str {
@@ -79,6 +86,7 @@ impl api::Runtime for Monty {
     fn compile(&self, source: &str) -> api::Result<Box<dyn api::Program>> {
         let compiled = prepare(source, &self.extensions)?;
         Ok(Box::new(Program {
+            expose_errors: self.expose_errors,
             network: self.network.clone(),
             http: Module::compile_graph(
                 &compiled.graph,
@@ -106,6 +114,7 @@ impl api::Runtime for Monty {
 
 #[derive(Clone)]
 struct Program {
+    expose_errors: bool,
     network: crate::network::Network,
     http: Module,
     objects: HashMap<String, Module>,
@@ -119,7 +128,12 @@ impl api::Program for Program {
         &self.classes
     }
     fn error_response(&self, error: api::Failure, durable: bool) -> Response {
-        let error = json!({"status":error.status,"code":error.code,"message":error.message});
+        let message = if self.expose_errors || error.status < 500 || durable {
+            error.message
+        } else {
+            "Python execution failed".into()
+        };
+        let error = json!({"status":error.status,"code":error.code,"message":message});
         json_response(
             if durable {
                 200
@@ -220,12 +234,15 @@ impl Program {
         };
         metadata["execution"] = serde_json::to_value(&call.execution).map_err(|e| e.to_string())?;
         metadata["limits"] = serde_json::to_value(call.limits).map_err(|e| e.to_string())?;
-        let (session, event) = Session::start_with_limits(function, &args, &metadata, call.limits)?;
+        let (session, event) =
+            Session::start_with_limits(function, &args, &metadata, call.limits, call.observer)?;
         let mut execution = Execution {
             session: Some(session),
             network: self.network.clone(),
             fetch_context,
             request: metadata["request"].clone(),
+            spans: HashMap::new(),
+            next_span: 0,
         };
         let step = execution.event(event)?;
         Ok((Box::new(execution), step))
@@ -235,6 +252,7 @@ impl Program {
 enum Event {
     Step(Step),
     Resume(Response),
+    ResumeValue(Value),
 }
 
 struct Execution {
@@ -242,6 +260,8 @@ struct Execution {
     fetch_context: crate::FetchContext,
     session: Option<Session>,
     request: Value,
+    spans: HashMap<u64, (String, Value, i64, std::time::Instant)>,
+    next_span: u64,
 }
 impl api::Execution for Execution {
     fn resume(&mut self, reply: HostReply) -> api::Result<Step> {
@@ -282,6 +302,13 @@ impl Execution {
                         .as_mut()
                         .ok_or("execution already completed")?
                         .resume(json!({"error":error.message}))?;
+                }
+                Ok(Event::ResumeValue(value)) => {
+                    event = self
+                        .session
+                        .as_mut()
+                        .ok_or("execution already completed")?
+                        .resume(json!({"result":value}))?;
                 }
                 Ok(Event::Resume(response)) => {
                     // Interpreter failures after a synthetic reply are final,
@@ -408,7 +435,60 @@ impl Execution {
             },
             "now" => HostCall::Now,
             "uuid" => HostCall::Uuid,
-            "log" => HostCall::Log(text(0)?),
+            "log" => {
+                let level = args[1].as_str().unwrap_or("info");
+                if !["debug", "info", "warn", "error"].contains(&level) {
+                    return Err("invalid log level".into());
+                }
+                let fields = args.get(2).cloned().unwrap_or_else(|| json!({}));
+                if !fields.is_object() {
+                    return Err("log fields must be an object".into());
+                }
+                session.output().flush();
+                session.output().emit(api::observability::Diagnostic::Log {
+                    level: level.into(),
+                    message: crate::observability::cap(&text(0)?, 6144),
+                    fields,
+                });
+                return Ok(Event::ResumeValue(Value::Null));
+            }
+            "span" => {
+                if args[0] == "start" {
+                    if self.spans.len() >= 16 || self.next_span >= 128 {
+                        return Err("custom span limit exceeded".into());
+                    }
+                    let name = text(1)?;
+                    if name.is_empty()
+                        || name.len() > 128
+                        || !args[2].is_object()
+                        || args[2].to_string().len() > 4096
+                    {
+                        return Err("invalid span name or fields".into());
+                    }
+                    self.next_span += 1;
+                    self.spans.insert(
+                        self.next_span,
+                        (
+                            name,
+                            args[2].clone(),
+                            chrono::Utc::now().timestamp_micros(),
+                            std::time::Instant::now(),
+                        ),
+                    );
+                    return Ok(Event::ResumeValue(json!(self.next_span)));
+                }
+                let id = args[1].as_u64().ok_or("invalid span token")?;
+                let (name, fields, start_unix_us, started) =
+                    self.spans.remove(&id).ok_or("unknown or completed span")?;
+                session.output().emit(api::observability::Diagnostic::Span {
+                    name,
+                    fields,
+                    start_unix_us,
+                    duration_us: started.elapsed().as_micros().min(i64::MAX as u128) as i64,
+                    ok: args[2].as_bool().ok_or("invalid span status")?,
+                });
+                return Ok(Event::ResumeValue(Value::Null));
+            }
             _ => return Err("unknown capability".into()),
         };
         if call.payload_bytes() > self.fetch_context.limits.max_payload_bytes {
@@ -462,6 +542,8 @@ fn complete(response: Response) -> Result<(Box<dyn api::Execution>, Step), Failu
                 alarm: false,
             },
             request: Value::Null,
+            spans: HashMap::new(),
+            next_span: 0,
         }),
         Step::Return(response),
     ))

@@ -12,6 +12,10 @@ autotests = false
 name = "extended-host"
 path = "examples/extended-host/main.rs"
 
+[[example]]
+name = "observability"
+path = "examples/observability/main.rs"
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]

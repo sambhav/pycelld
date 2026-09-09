@@ -111,7 +111,7 @@ fn span_message(span: &Span) -> Vec<u8> {
     if let Some(parent) = span.parent_span_id {
         field_bytes(&mut out, 4, &parent);
     }
-    field_str(&mut out, 5, span.name);
+    field_str(&mut out, 5, &span.name);
     field_varint(&mut out, 6, span.kind as u64);
     let start_ns = span.start_unix_us.max(0) as u64 * 1_000;
     let end_ns = start_ns + span.duration_us.max(0) as u64 * 1_000;
@@ -148,6 +148,9 @@ fn span_message(span: &Span) -> Vec<u8> {
     if let Some(remote) = span.parent_remote {
         key_value(&mut out, 9, "celld.parent_remote", any_bool(remote));
     }
+    if let Some(attributes) = &span.attributes {
+        key_value(&mut out, 9, "python.attributes", any_string(&attributes.to_string()));
+    }
     // Status (15): unset when ok, per the spec; ERROR (code=3 value 2)
     // with the message when not.
     if !span.ok {
@@ -183,7 +186,23 @@ fn log_message(log: &Log) -> Vec<u8> {
     let mut out = Vec::new();
     let time_ns = log.time_unix_us.max(0) as u64 * 1_000;
     field_fixed64(&mut out, 1, time_ns);
-    field_varint(&mut out, 2, 9); // SEVERITY_NUMBER_INFO
+    let structured = serde_json::from_str::<serde_json::Value>(&log.body).ok();
+    let python = structured.as_ref().filter(|v| v["execution"].is_object() && v["level"].is_string());
+    let severity = match python.and_then(|v| v["level"].as_str()) {
+        Some("debug") => 5,
+        Some("warn") => 13,
+        Some("error") => 17,
+        _ => 9,
+    };
+    field_varint(&mut out, 2, severity);
+    if let Some(record) = python {
+        if let Some(execution) = record["execution"].as_object() {
+            for (key, value) in execution {
+                if let Some(value) = value.as_str() { key_value(&mut out, 6, &format!("celld.{key}"), any_string(value)); }
+            }
+        }
+        key_value(&mut out, 6, "python.fields", any_string(&record["fields"].to_string()));
+    }
     field_bytes(&mut out, 5, &any_string(&log.body));
     if let Some(trace_id) = log.trace_id {
         field_bytes(&mut out, 9, &trace_id);

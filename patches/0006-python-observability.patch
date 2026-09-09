@@ -1,0 +1,286 @@
+diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
+index 648af6f..bb76a98 100644
+--- a/crates/celld/lib.rs
++++ b/crates/celld/lib.rs
+@@ -335,6 +335,7 @@ pub mod drain_token;
+ pub mod env_vars;
+ pub mod native;
+ mod native_host;
++mod native_observability;
+ pub mod s3_etag;
+ #[cfg(celld_internal_tests)]
+ #[allow(clippy::disallowed_methods)]
+diff --git a/crates/celld/native_observability.rs b/crates/celld/native_observability.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/celld/native_observability.rs
+@@ -0,0 +1,132 @@
++//! A captured, immutable host identity accompanies every native diagnostic.
++use crate::telemetry;
++use celld_runtime::{
++    ExecutionMetadata,
++    observability::{Diagnostic, Observer},
++};
++use serde_json::{Value, json};
++use std::sync::Arc;
++
++pub(crate) fn observer(
++    metadata: &ExecutionMetadata,
++    object: Option<&celld_runtime::Object>,
++    trace: Option<telemetry::TraceContext>,
++) -> Arc<dyn Observer> {
++    // Do not copy principal claims, request headers, variables, or secrets to logs.
++    let identity = json!({
++        "worker_id":metadata.worker_id,
++        "deployment_id":metadata.deployment_id,
++        "invocation_id":metadata.invocation_id,
++        "runtime_instance_id":metadata.runtime_instance_id,
++        "root_invocation_id":metadata.root_invocation_id,
++        "parent_invocation_id":metadata.parent_invocation_id,
++        "object_class":object.map(|o| &o.class),
++        "object_id":object.map(|o| &o.id),
++        "trace_id":trace.map(|t| t.trace_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
++        "span_id":trace.map(|t| t.span_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
++    });
++    // Logical object names can originate in request data and be arbitrarily long.
++    let mut identity = identity;
++    for value in identity.as_object_mut().unwrap().values_mut() {
++        if let Some(text) = value.as_str() {
++            if text.len() > 128 {
++                let mut end = 128;
++                while !text.is_char_boundary(end) {
++                    end -= 1;
++                }
++                *value = Value::String(format!("{}…", &text[..end]));
++            }
++        }
++    }
++    Arc::new(move |event: Diagnostic| {
++        let ids = trace.and_then(telemetry::TraceContext::recording_ids);
++        match event {
++            Diagnostic::Log {
++                level,
++                message,
++                fields,
++            } => {
++                let body = log_body(&identity, &level, message, fields);
++                match level.as_str() {
++                    "error" => tracing::error!(target: "native", "{body}"),
++                    "warn" => tracing::warn!(target: "native", "{body}"),
++                    "debug" => tracing::debug!(target: "native", "{body}"),
++                    _ => tracing::info!(target: "native", "{body}"),
++                }
++                // Respect the invocation's sampling decision, including unsampled parents.
++                if let Some(ids) = ids {
++                    telemetry::record_log(telemetry::Log {
++                        trace_id: Some(ids.trace_id),
++                        span_id: Some(ids.span_id),
++                        time_unix_us: telemetry::now_unix_us(),
++                        body,
++                    });
++                }
++            }
++            Diagnostic::Span {
++                name,
++                fields,
++                start_unix_us,
++                duration_us,
++                ok,
++            } => {
++                if let Some((parent, child)) = ids.zip(
++                    trace
++                        .map(|t| telemetry::child_context(&t))
++                        .and_then(telemetry::TraceContext::recording_ids),
++                ) {
++                    let mut span = telemetry::Span::new(child, "python", telemetry::KIND_INTERNAL);
++                    span.name = name.into();
++                    span.parent_span_id = Some(parent.span_id);
++                    span.parent_remote = Some(false);
++                    span.start_unix_us = start_unix_us;
++                    span.duration_us = duration_us;
++                    span.ok = ok;
++                    span.request_id = identity["invocation_id"].as_str().map(str::to_owned);
++                    span.attributes = Some(json!({"execution":identity,"fields":fields}));
++                    telemetry::record(span);
++                }
++            }
++        }
++    })
++}
++
++fn log_body(identity: &Value, level: &str, message: String, fields: Value) -> String {
++    let mut record = json!({"level":level,"message":message,"fields":fields,"execution":identity});
++    if record.to_string().len() > telemetry::LOG_BODY_CAP {
++        record["truncated"] = json!(true);
++        record["fields"] = json!({"truncated":true});
++        while record.to_string().len() > telemetry::LOG_BODY_CAP {
++            let text = record["message"].as_str().unwrap_or("");
++            if text.is_empty() {
++                break;
++            }
++            let mut end = text.len() / 2;
++            while !text.is_char_boundary(end) {
++                end -= 1;
++            }
++            record["message"] = Value::String(text[..end].to_owned());
++        }
++    }
++    record.to_string()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn user_fields_cannot_replace_identity_and_truncation_keeps_json_valid() {
++        let identity = json!({"invocation_id":"trusted","object_id":"object-a"});
++        let body = log_body(
++            &identity,
++            "info",
++            "\u{0001}".repeat(9000),
++            json!({"execution":{"invocation_id":"forged"}}),
++        );
++        assert!(body.len() <= telemetry::LOG_BODY_CAP);
++        let record: Value = serde_json::from_str(&body).unwrap();
++        assert_eq!(record["execution"]["invocation_id"], "trusted");
++        assert_eq!(record["execution"]["object_id"], "object-a");
++        assert_eq!(record["truncated"], true);
++    }
++}
+diff --git a/crates/celld/native_worker.rs b/crates/celld/native_worker.rs
+index b8a5c7d..f0f5be6 100644
+--- a/crates/celld/native_worker.rs
++++ b/crates/celld/native_worker.rs
+@@ -373,6 +373,7 @@ impl Worker {
+         }
+         let object = self.object(entry.scope.as_deref())?;
+         let (session, event) = self.program.start(api::Invocation {
++            observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, object.as_ref(), entry.trace)),
+             execution: entry.native.as_ref().unwrap().metadata.clone(),
+             limits: self.limits,
+             request: api::Request {
+@@ -486,6 +487,7 @@ impl Worker {
+         let _context = CurrentGuard::enter(entry.context.clone());
+         let result = (|| {
+             let (session, event) = self.program.start(api::Invocation {
++                observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, self.object(Some(&scope))?.as_ref(), entry.trace)),
+                 execution: entry.native.as_ref().unwrap().metadata.clone(),
+                 limits: self.limits,
+                 request: api::Request {
+diff --git a/crates/celld/otlp.rs b/crates/celld/otlp.rs
+index dd05c03..28ab4c4 100644
+--- a/crates/celld/otlp.rs
++++ b/crates/celld/otlp.rs
+@@ -111,7 +111,7 @@ fn span_message(span: &Span) -> Vec<u8> {
+     if let Some(parent) = span.parent_span_id {
+         field_bytes(&mut out, 4, &parent);
+     }
+-    field_str(&mut out, 5, span.name);
++    field_str(&mut out, 5, &span.name);
+     field_varint(&mut out, 6, span.kind as u64);
+     let start_ns = span.start_unix_us.max(0) as u64 * 1_000;
+     let end_ns = start_ns + span.duration_us.max(0) as u64 * 1_000;
+@@ -148,6 +148,9 @@ fn span_message(span: &Span) -> Vec<u8> {
+     if let Some(remote) = span.parent_remote {
+         key_value(&mut out, 9, "celld.parent_remote", any_bool(remote));
+     }
++    if let Some(attributes) = &span.attributes {
++        key_value(&mut out, 9, "python.attributes", any_string(&attributes.to_string()));
++    }
+     // Status (15): unset when ok, per the spec; ERROR (code=3 value 2)
+     // with the message when not.
+     if !span.ok {
+@@ -183,7 +186,23 @@ fn log_message(log: &Log) -> Vec<u8> {
+     let mut out = Vec::new();
+     let time_ns = log.time_unix_us.max(0) as u64 * 1_000;
+     field_fixed64(&mut out, 1, time_ns);
+-    field_varint(&mut out, 2, 9); // SEVERITY_NUMBER_INFO
++    let structured = serde_json::from_str::<serde_json::Value>(&log.body).ok();
++    let python = structured.as_ref().filter(|v| v["execution"].is_object() && v["level"].is_string());
++    let severity = match python.and_then(|v| v["level"].as_str()) {
++        Some("debug") => 5,
++        Some("warn") => 13,
++        Some("error") => 17,
++        _ => 9,
++    };
++    field_varint(&mut out, 2, severity);
++    if let Some(record) = python {
++        if let Some(execution) = record["execution"].as_object() {
++            for (key, value) in execution {
++                if let Some(value) = value.as_str() { key_value(&mut out, 6, &format!("celld.{key}"), any_string(value)); }
++            }
++        }
++        key_value(&mut out, 6, "python.fields", any_string(&record["fields"].to_string()));
++    }
+     field_bytes(&mut out, 5, &any_string(&log.body));
+     if let Some(trace_id) = log.trace_id {
+         field_bytes(&mut out, 9, &trace_id);
+diff --git a/crates/celld/telemetry.rs b/crates/celld/telemetry.rs
+index 276d21a..020224d 100644
+--- a/crates/celld/telemetry.rs
++++ b/crates/celld/telemetry.rs
+@@ -331,7 +331,8 @@ fn hex_nibble(byte: u8) -> Option<u8> {
+ pub struct Span {
+     pub ids: TraceIds,
+     pub parent_span_id: Option<[u8; 8]>,
+-    pub name: &'static str,
++    pub name: std::borrow::Cow<'static, str>,
++    pub attributes: Option<serde_json::Value>,
+     pub kind: u8,
+     pub start_unix_us: i64,
+     pub duration_us: i64,
+@@ -363,7 +364,8 @@ impl Span {
+         Span {
+             ids,
+             parent_span_id: None,
+-            name,
++            name: name.into(),
++            attributes: None,
+             kind,
+             start_unix_us: 0,
+             duration_us: 0,
+@@ -399,6 +401,7 @@ impl Event {
+                     + LEN(&span.request_id)
+                     + LEN(&span.cell)
+                     + LEN(&span.url)
++                    + span.attributes.as_ref().map_or(0, |v| v.to_string().len())
+             }
+             Event::Log(log) => 40 + log.body.len(),
+         }
+@@ -1074,6 +1077,7 @@ message celld_span {
+   optional binary url (STRING);
+   optional int32 http_status (INTEGER(16,false));
+   optional boolean parent_remote;
++  optional binary attributes (STRING);
+ }";
+ 
+ /// The logs signal: one row per captured console line, joined to traces
+@@ -1148,7 +1152,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
+     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.trace_id))).collect::<Vec<_>>());
+     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.span_id))).collect::<Vec<_>>());
+     column!(ByteArrayType, opt each.clone().map(|s| s.parent_span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
+-    column!(ByteArrayType, req each.clone().map(|s| text(s.name)).collect::<Vec<_>>());
++    column!(ByteArrayType, req each.clone().map(|s| text(&s.name)).collect::<Vec<_>>());
+     column!(Int32Type, req each.clone().map(|s| s.kind as i32).collect::<Vec<_>>());
+     column!(Int64Type, req each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>());
+     column!(Int64Type, req each.clone().map(|s| s.duration_us).collect::<Vec<_>>());
+@@ -1162,6 +1166,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
+     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
+     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
+     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
++    column!(ByteArrayType, opt each.clone().map(|s| s.attributes.as_ref().map(|a| text(&a.to_string()))).collect::<Vec<_>>());
+ 
+     group.close()?;
+     Ok(writer.into_inner()?)
+diff --git a/docs/telemetry.md b/docs/telemetry.md
+index bc756bd..8ef0223 100644
+--- a/docs/telemetry.md
++++ b/docs/telemetry.md
+@@ -152,3 +152,7 @@ the current hour, because a node still writes to it. Delete the source
+ files after DuckDB writes the compacted file. The compacted file is
+ also smaller, because zstd compresses one sorted batch better than
+ many separate files.
++
++Native Python spans also carry an optional `attributes` JSON column in Parquet.
++OTLP exports it as `python.attributes`. Python logs use a bounded JSON body with
++`level`, `message`, user `fields`, and authoritative `execution` metadata.

@@ -118,5 +118,22 @@ class Context:
     def uuid(self) -> str:
         return _celld_host("uuid")
 
-    def log(self, message: str) -> None:
-        _celld_host("log", message)
+    def log(self, message: str, *, level: str = "info", fields: dict | None = None) -> None:
+        _celld_host("log", message, level, fields or {})
+
+    def span(self, name: str, *, fields: dict | None = None):
+        return _Span(name, fields or {})
+
+class _Span:
+    def __init__(self, name, fields):
+        self._name = name
+        self._fields = fields
+        self._token = None
+
+    def __enter__(self):
+        self._token = _celld_host("span", "start", self._name, self._fields)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        _celld_host("span", "end", self._token, exc_type is None)
+        return False

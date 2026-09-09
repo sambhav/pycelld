@@ -4,6 +4,7 @@ mod extensions;
 mod filesystem;
 mod modules;
 mod network;
+mod observability;
 mod package;
 mod runtime;
 mod value;
@@ -81,9 +82,11 @@ pub const CAPABILITIES: &[&str] = &[
     "now",
     "uuid",
     "log",
+    "span",
 ];
 
 pub(crate) struct Session {
+    output: observability::Output,
     pending: Option<FunctionCall>,
     pending_os: Option<(monty::OsCall, filesystem::ResultType)>,
     filesystem_call: Option<celld_runtime::filesystem::FsCall>,
@@ -105,6 +108,7 @@ impl Session {
             args,
             context,
             celld_runtime::ExecutionLimits::default(),
+            None,
         )
     }
     pub fn start_with_limits(
@@ -112,9 +116,11 @@ impl Session {
         args: &Value,
         context: &Value,
         limits: celld_runtime::ExecutionLimits,
+        observer: Option<std::sync::Arc<dyn celld_runtime::observability::Observer>>,
     ) -> Result<(Self, Value), Failure> {
         limits.validate()?;
         let mut session = Self {
+            output: observability::Output::new(observer, function.sources.clone()),
             pending: None,
             pending_os: None,
             filesystem_call: None,
@@ -124,9 +130,14 @@ impl Session {
             response: None,
             extensions: function.extensions.clone(),
         };
-        let event = session.advance(function.start_with_limits(args, context, limits)?)?;
+        let progress = function.start_with_limits(args, context, limits, &mut session.output)?;
+        let event = session.advance(progress)?;
         Ok((session, event))
     }
+    pub fn output(&mut self) -> &mut observability::Output {
+        &mut self.output
+    }
+
     pub fn take_response(&mut self) -> Option<value::HttpResponse> {
         self.response.take()
     }
@@ -158,8 +169,11 @@ impl Session {
     ) -> Result<Value, Failure> {
         let (call, result) = self.pending_os.take().ok_or("no pending OS call")?;
         let progress = call
-            .resume(filesystem::response(reply, result), PrintWriter::Disabled)
-            .map_err(Failure::python)?;
+            .resume(
+                filesystem::response(reply, result),
+                PrintWriter::Callback(&mut self.output),
+            )
+            .map_err(|error| self.output.failure(error))?;
         self.advance(progress)
     }
     pub fn resume(&mut self, reply: Value) -> Result<Value, Failure> {
@@ -194,8 +208,8 @@ impl Session {
             ExtFunctionResult::Return(value::from_json(&reply["result"]))
         };
         let progress = call
-            .resume(reply, PrintWriter::Disabled)
-            .map_err(Failure::python)?;
+            .resume(reply, PrintWriter::Callback(&mut self.output))
+            .map_err(|error| self.output.failure(error))?;
         self.advance(progress)
     }
     /// Resume native HTTP without expanding a body into JSON numbers. The
@@ -228,12 +242,16 @@ impl Session {
             .into(),
         );
         let progress = call
-            .resume(ExtFunctionResult::Return(value), PrintWriter::Disabled)
-            .map_err(Failure::python)?;
+            .resume(
+                ExtFunctionResult::Return(value),
+                PrintWriter::Callback(&mut self.output),
+            )
+            .map_err(|error| self.output.failure(error))?;
         self.advance(progress)
     }
     fn advance(&mut self, mut progress: RunProgress) -> Result<Value, Failure> {
         loop {
+            self.output.flush();
             if let RunProgress::FunctionCall(call) = &progress {
                 if let Some((arity, callback)) = self.extensions.functions.get(&call.function_name)
                 {
@@ -278,9 +296,9 @@ impl Session {
                                 Ok(value) => ExtFunctionResult::Return(value),
                                 Err(error) => ExtFunctionResult::Error(error),
                             },
-                            PrintWriter::Disabled,
+                            PrintWriter::Callback(&mut self.output),
                         )
-                        .map_err(Failure::python)?;
+                        .map_err(|error| self.output.failure(error))?;
                     continue;
                 }
             }
@@ -301,8 +319,11 @@ impl Session {
                     }
                     Err(error) => {
                         progress = call
-                            .resume(ExtFunctionResult::Error(error), PrintWriter::Disabled)
-                            .map_err(Failure::python)?;
+                            .resume(
+                                ExtFunctionResult::Error(error),
+                                PrintWriter::Callback(&mut self.output),
+                            )
+                            .map_err(|error| self.output.failure(error))?;
                         continue;
                     }
                 }

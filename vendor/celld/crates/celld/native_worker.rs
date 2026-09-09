@@ -373,6 +373,7 @@ impl Worker {
         }
         let object = self.object(entry.scope.as_deref())?;
         let (session, event) = self.program.start(api::Invocation {
+            observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, object.as_ref(), entry.trace)),
             execution: entry.native.as_ref().unwrap().metadata.clone(),
             limits: self.limits,
             request: api::Request {
@@ -486,6 +487,7 @@ impl Worker {
         let _context = CurrentGuard::enter(entry.context.clone());
         let result = (|| {
             let (session, event) = self.program.start(api::Invocation {
+                observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, self.object(Some(&scope))?.as_ref(), entry.trace)),
                 execution: entry.native.as_ref().unwrap().metadata.clone(),
                 limits: self.limits,
                 request: api::Request {

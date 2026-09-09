@@ -5,6 +5,7 @@ mod execution;
 pub mod filesystem;
 mod payload;
 pub use execution::{ExecutionLimits, ExecutionMetadata, VerifiedPrincipal};
+pub mod observability;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 
@@ -63,6 +64,8 @@ pub struct Invocation {
     /// Authoritative host data; never reconstructed from worker arguments.
     pub execution: ExecutionMetadata,
     pub limits: ExecutionLimits,
+    /// Host-owned diagnostic sink; implementations must never block worker execution.
+    pub observer: Option<std::sync::Arc<dyn observability::Observer>>,
     pub request: Request,
     pub object: Option<Object>,
     pub alarm: bool,

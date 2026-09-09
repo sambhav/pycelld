@@ -335,6 +335,7 @@ pub mod drain_token;
 pub mod env_vars;
 pub mod native;
 mod native_host;
+mod native_observability;
 pub mod s3_etag;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]

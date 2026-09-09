@@ -331,7 +331,8 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 pub struct Span {
     pub ids: TraceIds,
     pub parent_span_id: Option<[u8; 8]>,
-    pub name: &'static str,
+    pub name: std::borrow::Cow<'static, str>,
+    pub attributes: Option<serde_json::Value>,
     pub kind: u8,
     pub start_unix_us: i64,
     pub duration_us: i64,
@@ -363,7 +364,8 @@ impl Span {
         Span {
             ids,
             parent_span_id: None,
-            name,
+            name: name.into(),
+            attributes: None,
             kind,
             start_unix_us: 0,
             duration_us: 0,
@@ -399,6 +401,7 @@ impl Event {
                     + LEN(&span.request_id)
                     + LEN(&span.cell)
                     + LEN(&span.url)
+                    + span.attributes.as_ref().map_or(0, |v| v.to_string().len())
             }
             Event::Log(log) => 40 + log.body.len(),
         }
@@ -1074,6 +1077,7 @@ message celld_span {
   optional binary url (STRING);
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
+  optional binary attributes (STRING);
 }";
 
 /// The logs signal: one row per captured console line, joined to traces
@@ -1148,7 +1152,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.trace_id))).collect::<Vec<_>>());
     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.span_id))).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.parent_span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|s| text(s.name)).collect::<Vec<_>>());
+    column!(ByteArrayType, req each.clone().map(|s| text(&s.name)).collect::<Vec<_>>());
     column!(Int32Type, req each.clone().map(|s| s.kind as i32).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.duration_us).collect::<Vec<_>>());
@@ -1162,6 +1166,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| s.attributes.as_ref().map(|a| text(&a.to_string()))).collect::<Vec<_>>());
 
     group.close()?;
     Ok(writer.into_inner()?)
