@@ -48,4 +48,5 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - run: python tools/monty-checks/e2e.py target/lab/celld
       - run: python tools/monty-checks/http_handlers.py target/lab/celld
+      - run: python tools/monty-checks/network_policy.py target/lab/celld
       - run: python tools/monty-checks/consumer.py

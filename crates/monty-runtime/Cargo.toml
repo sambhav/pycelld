@@ -15,6 +15,10 @@ path = "tests/extension.rs"
 name = "execution"
 path = "tests/execution.rs"
 
+[[test]]
+name = "network_policy"
+path = "tests/network_policy.rs"
+
 [dependencies]
 celld-runtime = { path = "../runtime-api" }
 url = "2"

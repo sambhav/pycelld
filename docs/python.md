@@ -211,7 +211,9 @@ Python extensions, `yield`, async iterators, streaming, WebSockets, queues and
 workflows are unsupported.
 
 
-Outbound HTTP is disabled in the supplied binary. Custom Rust hosts can install
+Outbound HTTP is disabled by default. The supplied binary can load an operator-owned
+[Python network policy](network-policy.md) using `CELLD_PYTHON_NETWORK_POLICY`.
+Custom Rust hosts can install
 [fetch middleware](extensions.md#outbound-http-middleware) to inspect, rewrite,
 answer or deny each `ctx.fetch` call. A denied request raises `RuntimeError`.
 Redirects are returned without following them.

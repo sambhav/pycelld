@@ -146,7 +146,9 @@ version and are not a stable upstream extension API.
 
 ## Outbound HTTP middleware
 
-`Monty::new()` and the supplied `celld` binary deny all Python outbound HTTP.
+`Monty::new()` and the supplied `celld` binary deny Python outbound HTTP by default.
+The binary can load an operator-owned [Python network policy](network-policy.md)
+using `CELLD_PYTHON_NETWORK_POLICY`, without a Rust build.
 Workers retain the typed `await ctx.fetch(...)` interface, but cannot grant
 themselves network access. An embedding Rust host installs the policy:
 
