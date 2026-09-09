@@ -30,7 +30,7 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-http-v1",
+    required_feature: "monty-application-policy-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
@@ -45,6 +45,7 @@ impl api::Runtime for Monty {
             "monty-execution-v1",
             "monty-observability-v1",
             "monty-http-v1",
+            "monty-application-policy-v1",
         ]
     }
     fn types(&self) -> &str {

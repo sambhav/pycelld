@@ -299,7 +299,7 @@ fn monty_builds_native_python_without_javascript_modules() {
         .manifest
         .required_features
         .iter()
-        .any(|f| f == "monty-http-v1"));
+        .any(|f| f == "monty-application-policy-v1"));
     assert!(!built
         .modules
         .iter()
@@ -343,7 +343,7 @@ fn package_deployments_discover_submodule_classes_and_version_every_source() {
     assert_eq!(built.manifest.do_classes, ["shop.objects.Counter"]);
     assert_eq!(built.manifest.sqlite_classes, ["shop.objects.Counter"]);
     assert_eq!(built.modules.len(), 1);
-    assert!(built.manifest.required_features.iter().any(|f|f == "monty-http-v1"));
+    assert!(built.manifest.required_features.iter().any(|f|f == "monty-application-policy-v1"));
     // A submodule edit changes the deploy hash, even when __init__.py is unchanged.
     std::fs::write(package.join("values.py"), "answer = 43").unwrap();
     let updated = build(&options(config.clone())).unwrap();

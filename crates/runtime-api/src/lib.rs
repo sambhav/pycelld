@@ -4,8 +4,9 @@
 mod execution;
 pub mod filesystem;
 mod payload;
-pub use execution::{ExecutionLimits, ExecutionMetadata, VerifiedPrincipal};
+pub use execution::{ApplicationIdentity, ExecutionLimits, ExecutionMetadata, VerifiedPrincipal};
 pub mod observability;
+pub mod policy;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 

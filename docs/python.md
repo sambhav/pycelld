@@ -205,6 +205,10 @@ source per deployment, 32 package directory levels, 1 MiB per request/result/hos
 reply, 100 ms of
 interpreter execution, 10,000 host operations, 256 live invocations per worker
 slot, 16 nested transactions, and a 30-second wall-clock deadline per durable turn.
+The CPU, wall, operation, payload, and recursion defaults can be overridden per
+invocation with [live application policies](execution.md), including project,
+stage, tier, and custom identity mappings. Per-invocation memory quotas are not
+yet supported; the execution guide explains the accounting and isolation gap.
 
 Monty implements a reduced Python subset. External package installation, native
 Python extensions, `yield`, async iterators, streaming, WebSockets, queues and

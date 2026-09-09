@@ -51,7 +51,16 @@ class Response:
     def text(self) -> str: ...
     def json(self) -> Json: ...
 
+class ApplicationIdentity:
+    project_id: str
+    application_id: str
+    stage: str | None
+    tier: str | None
+    labels: dict[str, str]
+
 class ExecutionMetadata:
+    application: ApplicationIdentity
+    policy_revision: str
     worker_id: str
     deployment_id: str
     invocation_id: str
@@ -65,6 +74,8 @@ class ExecutionLimits:
     wall_ms: int
     max_operations: int
     max_payload_bytes: int
+    max_recursion_depth: int
+    max_memory_bytes: int | None
 
 class Context:
     execution: ExecutionMetadata

@@ -98,6 +98,15 @@ class Request:
         return [value for key, value in self.query_items if key == name]
 
 
+class ApplicationIdentity:
+    def __init__(self, metadata):
+        self.project_id = metadata.get("project_id", "")
+        self.application_id = metadata.get("application_id", "")
+        self.stage = metadata.get("stage")
+        self.tier = metadata.get("tier")
+        self.labels = metadata.get("labels", {})
+
+
 class ExecutionMetadata:
     def __init__(self, metadata):
         self.worker_id = metadata.get("worker_id", "")
@@ -107,6 +116,8 @@ class ExecutionMetadata:
         self.root_invocation_id = metadata.get("root_invocation_id", "")
         self.parent_invocation_id = metadata.get("parent_invocation_id")
         self.principal = metadata.get("principal")
+        self.application = ApplicationIdentity(metadata.get("application", {}))
+        self.policy_revision = metadata.get("policy_revision", "")
 
 
 class ExecutionLimits:
@@ -115,6 +126,8 @@ class ExecutionLimits:
         self.wall_ms = metadata.get("wall_ms", 30000)
         self.max_operations = metadata.get("max_operations", 10000)
         self.max_payload_bytes = metadata.get("max_payload_bytes", 1048576)
+        self.max_recursion_depth = metadata.get("max_recursion_depth", 100)
+        self.max_memory_bytes = metadata.get("max_memory_bytes")
 
 
 class Context:

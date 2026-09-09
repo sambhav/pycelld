@@ -10,6 +10,7 @@ pub type PythonResult<T> = Result<T, PythonError>;
 type Callback = dyn Fn(Vec<PythonValue>) -> PythonResult<PythonValue> + Send + Sync;
 pub(crate) const BUILTINS: &[&str] = &[
     "Context", "Storage", "Alarms", "Request", "Response", "Json", "SqlValue",
+    "ApplicationIdentity", "ExecutionMetadata", "ExecutionLimits",
 ];
 
 /// An importable Python module with Rust functions and Python helpers/classes.
