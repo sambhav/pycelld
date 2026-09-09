@@ -36,6 +36,7 @@ use hyper_util::rt::TokioIo;
 
 use super::*;
 use celld::js::HttpChunkStream;
+use base64::Engine as _;
 
 pub(crate) const TUNNEL_PROTOCOL: &str = "celld-tunnel";
 pub(crate) const TUNNEL_VERSION: &str = "5";
@@ -49,7 +50,8 @@ pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
+const NATIVE_PARENT_HEADER: &str = "x-cells-native-parent";
+const CONTROL_HEADERS: [&str; 5] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER, NATIVE_PARENT_HEADER];
 
 enum TunnelKind {
     Do,
@@ -59,6 +61,7 @@ enum TunnelKind {
 /// The control fields of one tunneled call, carried as inner-request headers
 /// so one tunnel can serve calls for any cell.
 pub(crate) struct TunnelControl {
+    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
     pub(crate) scope: String,
     pub(crate) name: Option<String>,
     pub(crate) request_id: Option<celld::js::RequestId>,
@@ -169,7 +172,19 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
             else {
                 return Ok::<_, Infallible>(peer_response(malformed_scope()));
             };
+            // This is inside an authenticated peer tunnel. Public HTTP headers
+            // never populate this field; the sender strips user copies.
+            let native_parent = match inner.headers().get(NATIVE_PARENT_HEADER) {
+                Some(value) => match value.to_str().ok().filter(|s| s.len() <= 16 * 1024)
+                    .and_then(|s| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+                    Some(value) => Some(value),
+                    None => return Ok(peer_response(response(StatusCode::BAD_REQUEST, "invalid native execution context"))),
+                },
+                None => None,
+            };
             let control = TunnelControl {
+                native_parent,
                 scope,
                 name: inner
                     .headers()
@@ -234,6 +249,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
             };
             let body = celld::js::RequestBody::Stream(stream_id);
             let fetch = ForwardedFetch {
+                native_parent: control.native_parent,
                 name: control.name,
                 url: parts.uri.to_string(),
                 method: parts.method.to_string(),
@@ -405,6 +421,11 @@ fn inner_request(
             continue;
         }
         inner = inner.header(name.as_str(), value.as_str());
+    }
+    if let Some(parent) = &control.native_parent {
+        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(parent)?);
+        anyhow::ensure!(value.len() <= 16 * 1024, "native execution context exceeds 16 KiB");
+        inner = inner.header(NATIVE_PARENT_HEADER, value);
     }
     inner = inner.header(SCOPE_HEADER, control.scope.as_str());
     if let Some(name) = &control.name {

@@ -32,7 +32,8 @@ impl Host {
                     Some(scope) => storage::filesystem::call(scope, call),
                     None => Err(celld_runtime::filesystem::FsError::new(
                         celld_runtime::filesystem::FsErrorKind::Permission,
-                        "filesystem access requires a durable object")),
+                        "filesystem access requires a durable object",
+                    )),
                 };
                 return Ok((HostReply::Filesystem(reply), None));
             }
@@ -179,7 +180,7 @@ fn decode(value: storage::StoredValue) -> Result<Value, String> {
         ),
     }
 }
-fn new_uuid() -> Result<String, String> {
+pub(super) fn new_uuid() -> Result<String, String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

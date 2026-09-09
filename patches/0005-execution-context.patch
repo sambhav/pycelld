@@ -1,0 +1,714 @@
+diff --git a/crates/celld/env_vars.rs b/crates/celld/env_vars.rs
+index c4329b6..e13f8d1 100644
+--- a/crates/celld/env_vars.rs
++++ b/crates/celld/env_vars.rs
+@@ -38,6 +38,7 @@ pub struct ShutdownTiming {
+ /// they cannot return a configuration error at the point of use. This pass
+ /// makes those reads infallible without giving malformed values a default.
+ pub fn validate() -> anyhow::Result<()> {
++    native_limits()?;
+     cell_isolate_limit()?;
+     crate::s3_etag::S3EtagMode::from_env()?;
+     for name in [
+@@ -290,3 +291,18 @@ mod cell_isolate_limit_tests {
+         }
+     }
+ }
++
++/// Process-level native ceilings, never read from worker variables.
++pub fn native_limits() -> anyhow::Result<celld_runtime::ExecutionLimits> {
++    let limits: celld_runtime::ExecutionLimits = match std::env::var("CELLD_NATIVE_LIMITS") {
++        Ok(value) => {
++            serde_json::from_str(&value).map_err(|e| anyhow::anyhow!("CELLD_NATIVE_LIMITS: {e}"))?
++        }
++        Err(std::env::VarError::NotPresent) => Default::default(),
++        Err(error) => anyhow::bail!("CELLD_NATIVE_LIMITS: {error}"),
++    };
++    limits
++        .validate()
++        .map_err(|e| anyhow::anyhow!("CELLD_NATIVE_LIMITS: {e}"))?;
++    Ok(limits)
++}
+diff --git a/crates/celld/js.rs b/crates/celld/js.rs
+index 3d6a740..8f7787c 100644
+--- a/crates/celld/js.rs
++++ b/crates/celld/js.rs
+@@ -112,6 +112,7 @@ macro_rules! exc {
+ /// owner and HTTP-proxies the fetch, replying on `reply` (an async oneshot the
+ /// async-op future awaits — the JS thread is never blocked).
+ pub struct DoCallReq {
++    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
+     pub request_id: Option<RequestId>,
+     pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+     /// An explicit JavaScript AbortSignal must reach the target handler, even
+@@ -2769,6 +2770,7 @@ pub enum AlarmDispatch {
+ /// handler to run.
+ pub enum CellJob {
+     Fetch {
++        native_parent: Option<celld_runtime::ExecutionMetadata>,
+         request_id: Option<RequestId>,
+         scope: String,
+         name: Option<String>,
+@@ -3953,6 +3955,8 @@ pub struct QueueConsumerRegistration {
+ }
+ 
+ pub struct WorkerConfig {
++    pub deployment_id: Option<String>,
++    pub verified_principal: Option<celld_runtime::VerifiedPrincipal>,
+     src: String,
+     pub script_name: String,
+     do_classes: Vec<String>,
+@@ -4085,6 +4089,8 @@ impl WorkerConfig {
+             })
+             .collect();
+         Self {
++            deployment_id: None,
++            verified_principal: None,
+             src,
+             script_name,
+             do_classes,
+@@ -4114,6 +4120,17 @@ impl WorkerConfig {
+         }
+     }
+ 
++    /// Trusted embedding hosts may attach authentication results; worker code
++    /// and request headers never populate this value.
++    pub fn with_verified_principal(mut self, principal: celld_runtime::VerifiedPrincipal) -> Self {
++        self.verified_principal = Some(principal);
++        self
++    }
++    pub fn with_deployment_id(mut self, id: String) -> Self {
++        self.deployment_id = Some(id);
++        self
++    }
++
+     /// Stamp this Worker with the application generation it serves.
+     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
+         self.generation = generation;
+@@ -5277,22 +5294,14 @@ impl InFlight {
+     /// time the handler already spent.
+     pub fn remaining(&self, budget: Duration) -> Option<Duration> {
+         self.reply.is_some().then(|| {
+-            let budget = if self.native.is_some() && self.scope.is_some() {
+-                budget.min(Duration::from_secs(30))
+-            } else {
+-                budget
+-            };
++            let budget = self.native.as_ref().map_or(budget, |native| budget.min(native.wall_budget()));
+             budget.saturating_sub(self.started.elapsed())
+         })
+     }
+ 
+     /// Give up on a handler that will not settle.
+     pub fn time_out(&mut self, budget: Duration) {
+-        let budget = if self.native.is_some() && self.scope.is_some() {
+-            budget.min(Duration::from_secs(30))
+-        } else {
+-            budget
+-        };
++        let budget = self.native.as_ref().map_or(budget, |native| budget.min(native.wall_budget()));
+         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+     }
+ 
+@@ -6644,6 +6653,7 @@ fn dispatcher<'s>(
+ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
+     match job {
+         CellJob::Fetch {
++            native_parent: _,
+             request_id,
+             scope,
+             name,
+@@ -9088,6 +9098,7 @@ fn op_facet_fetch(
+         .await?;
+         let (reply, receive) = tokio::sync::oneshot::channel();
+         let job = CellJob::Fetch {
++            native_parent: None,
+             request_id: None,
+             scope: facet_scope,
+             name: None,
+@@ -9260,6 +9271,7 @@ fn op_do_call_impl(
+     let mut cancel_guard = DoCallCancelGuard::new(request_id);
+     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+     let request = DoCallReq {
++        native_parent: None,
+         request_id: Some(request_id),
+         cancel: Some(cancel),
+         deliver_abort_to_handler: cancellable,
+diff --git a/crates/celld/main.rs b/crates/celld/main.rs
+index bbf61d7..52fb84e 100644
+--- a/crates/celld/main.rs
++++ b/crates/celld/main.rs
+@@ -698,6 +698,7 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
+     dispatch_do_call(
+         app,
+         DoCallReq {
++        native_parent: None,
+             request_id: None,
+             cancel: None,
+             deliver_abort_to_handler: false,
+@@ -1012,6 +1013,7 @@ fn local_dispatch_request_id(
+ 
+ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
+     let DoCallReq {
++        native_parent,
+         request_id,
+         cancel,
+         deliver_abort_to_handler,
+@@ -1105,6 +1107,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
+                                 scope.clone(),
+                                 name,
+                                 RuntimeFetch {
++        native_parent: native_parent.clone(),
+                                     url,
+                                     method,
+                                     body,
+@@ -1225,6 +1228,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
+                 );
+                 {
+                     let control = peer_tunnel::TunnelControl {
++        native_parent: native_parent.clone(),
+                         scope: scope.clone(),
+                         name: name.clone(),
+                         request_id,
+@@ -2012,6 +2016,7 @@ async fn dispatch_cell_fetch(
+     let (reply, receive) = oneshot::channel();
+     let (cancel_tx, cancel) = oneshot::channel();
+     let accepted = celld::js::submit_do_call(celld::js::DoCallReq {
++        native_parent: None,
+         // Named, and named here: the abort fires only for a call that carries
+         // both an id and a cancel signal, so leaving this None silently costs
+         // the cancellation rather than failing.
+@@ -2066,6 +2071,7 @@ async fn dispatch_cell_fetch(
+ 
+ /// One forwarded cell fetch, after transport decode.
+ pub(crate) struct ForwardedFetch {
++    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
+     pub(crate) name: Option<String>,
+     pub(crate) url: String,
+     pub(crate) method: String,
+@@ -2092,6 +2098,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
+     request_body: celld::js::RequestBody,
+ ) -> ForwardedFetchOutcome {
+     let ForwardedFetch {
++        native_parent,
+         name,
+         url,
+         method,
+@@ -2137,6 +2144,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
+                     scope,
+                     name,
+                     RuntimeFetch {
++        native_parent,
+                         url,
+                         method,
+                         body: request_body,
+@@ -2584,6 +2592,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
+     dispatch_do_call(
+         app,
+         DoCallReq {
++        native_parent: None,
+             request_id: None,
+             cancel: None,
+             deliver_abort_to_handler: false,
+diff --git a/crates/celld/main/peer_tunnel.rs b/crates/celld/main/peer_tunnel.rs
+index 765345d..8451424 100644
+--- a/crates/celld/main/peer_tunnel.rs
++++ b/crates/celld/main/peer_tunnel.rs
+@@ -36,6 +36,7 @@ use hyper_util::rt::TokioIo;
+ 
+ use super::*;
+ use celld::js::HttpChunkStream;
++use base64::Engine as _;
+ 
+ pub(crate) const TUNNEL_PROTOCOL: &str = "celld-tunnel";
+ pub(crate) const TUNNEL_VERSION: &str = "5";
+@@ -49,7 +50,8 @@ pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+ /// The inner headers node A owns. A overwrites them on the way in and B
+ /// strips them on the way out, so an application header with a reserved name
+ /// is dropped rather than obeyed.
+-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
++const NATIVE_PARENT_HEADER: &str = "x-cells-native-parent";
++const CONTROL_HEADERS: [&str; 5] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER, NATIVE_PARENT_HEADER];
+ 
+ enum TunnelKind {
+     Do,
+@@ -59,6 +61,7 @@ enum TunnelKind {
+ /// The control fields of one tunneled call, carried as inner-request headers
+ /// so one tunnel can serve calls for any cell.
+ pub(crate) struct TunnelControl {
++    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
+     pub(crate) scope: String,
+     pub(crate) name: Option<String>,
+     pub(crate) request_id: Option<celld::js::RequestId>,
+@@ -169,7 +172,19 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
+             else {
+                 return Ok::<_, Infallible>(peer_response(malformed_scope()));
+             };
++            // This is inside an authenticated peer tunnel. Public HTTP headers
++            // never populate this field; the sender strips user copies.
++            let native_parent = match inner.headers().get(NATIVE_PARENT_HEADER) {
++                Some(value) => match value.to_str().ok().filter(|s| s.len() <= 16 * 1024)
++                    .and_then(|s| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
++                    .and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
++                    Some(value) => Some(value),
++                    None => return Ok(peer_response(response(StatusCode::BAD_REQUEST, "invalid native execution context"))),
++                },
++                None => None,
++            };
+             let control = TunnelControl {
++                native_parent,
+                 scope,
+                 name: inner
+                     .headers()
+@@ -234,6 +249,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
+             };
+             let body = celld::js::RequestBody::Stream(stream_id);
+             let fetch = ForwardedFetch {
++                native_parent: control.native_parent,
+                 name: control.name,
+                 url: parts.uri.to_string(),
+                 method: parts.method.to_string(),
+@@ -406,6 +422,11 @@ fn inner_request(
+         }
+         inner = inner.header(name.as_str(), value.as_str());
+     }
++    if let Some(parent) = &control.native_parent {
++        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(parent)?);
++        anyhow::ensure!(value.len() <= 16 * 1024, "native execution context exceeds 16 KiB");
++        inner = inner.header(NATIVE_PARENT_HEADER, value);
++    }
+     inner = inner.header(SCOPE_HEADER, control.scope.as_str());
+     if let Some(name) = &control.name {
+         inner = inner.header(NAME_HEADER, name);
+diff --git a/crates/celld/native_host.rs b/crates/celld/native_host.rs
+index 5159603..4e59113 100644
+--- a/crates/celld/native_host.rs
++++ b/crates/celld/native_host.rs
+@@ -32,7 +32,8 @@ impl Host {
+                     Some(scope) => storage::filesystem::call(scope, call),
+                     None => Err(celld_runtime::filesystem::FsError::new(
+                         celld_runtime::filesystem::FsErrorKind::Permission,
+-                        "filesystem access requires a durable object")),
++                        "filesystem access requires a durable object",
++                    )),
+                 };
+                 return Ok((HostReply::Filesystem(reply), None));
+             }
+@@ -179,7 +180,7 @@ fn decode(value: storage::StoredValue) -> Result<Value, String> {
+         ),
+     }
+ }
+-fn new_uuid() -> Result<String, String> {
++pub(super) fn new_uuid() -> Result<String, String> {
+     let mut bytes = [0u8; 16];
+     getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+     bytes[6] = (bytes[6] & 0x0f) | 0x40;
+diff --git a/crates/celld/native_worker.rs b/crates/celld/native_worker.rs
+index b507a51..b8a5c7d 100644
+--- a/crates/celld/native_worker.rs
++++ b/crates/celld/native_worker.rs
+@@ -6,13 +6,14 @@ use crate::native_host::Host;
+ use celld_runtime::{self as api, Failure, HostCall, HostReply, Step};
+ use serde_json::{Value, json};
+ 
+-const BODY_LIMIT: usize = 1024 * 1024;
+-
+ #[cfg(test)]
+ #[path = "../../../../tests/native_durability.rs"]
+ mod tests;
+ 
+ pub struct Worker {
++    runtime_instance_id: String,
++    deployment_id: String,
++    limits: api::ExecutionLimits,
+     config: Arc<WorkerConfig>,
+     program: Box<dyn api::Program>,
+     env: Value,
+@@ -55,6 +56,9 @@ struct Incoming {
+ }
+ 
+ pub(super) struct Execution {
++    pub(super) metadata: api::ExecutionMetadata,
++    limits: api::ExecutionLimits,
++    operations: usize,
+     session: Option<Box<dyn api::Execution>>,
+     host: Host,
+     input: Option<Incoming>,
+@@ -62,8 +66,20 @@ pub(super) struct Execution {
+     _live: Arc<()>,
+ }
+ 
++impl Execution {
++    pub(super) fn wall_budget(&self) -> Duration {
++        Duration::from_millis(self.limits.wall_ms)
++    }
++}
++
+ impl Worker {
+     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Self> {
++        let limits = crate::env_vars::native_limits()?;
++        let runtime_instance_id = crate::native_host::new_uuid().map_err(|e| anyhow!(e))?;
++        let deployment_id = config.deployment_id.clone().unwrap_or_else(|| {
++            use sha2::Digest;
++            format!("source:{:x}", sha2::Sha256::digest(config.src.as_bytes()))
++        });
+         let program = config
+             .native_program
+             .get_or_init(|| {
+@@ -104,6 +120,9 @@ impl Worker {
+             }
+         }
+         Ok(Self {
++            runtime_instance_id,
++            deployment_id,
++            limits,
+             program,
+             config,
+             env: Value::Object(env),
+@@ -175,7 +194,24 @@ impl Worker {
+         scope: Option<String>,
+         request_id: Option<RequestId>,
+         trace: Option<crate::telemetry::TraceContext>,
++        parent: Option<api::ExecutionMetadata>,
+     ) -> InFlight {
++        let invocation_id = crate::native_host::new_uuid().expect("OS random source unavailable");
++        let metadata = api::ExecutionMetadata {
++            worker_id: self.config.script_name.clone(),
++            deployment_id: self.deployment_id.clone(),
++            runtime_instance_id: self.runtime_instance_id.clone(),
++            root_invocation_id: parent
++                .as_ref()
++                .map_or_else(|| invocation_id.clone(), |p| p.root_invocation_id.clone()),
++            parent_invocation_id: parent.as_ref().map(|p| p.invocation_id.clone()),
++            principal: self
++                .config
++                .verified_principal
++                .clone()
++                .or_else(|| parent.and_then(|p| p.principal)),
++            invocation_id,
++        };
+         let context = IoContext::new();
+         let writes_before = scope.as_deref().and_then(storage::write_position);
+         context.begin_event();
+@@ -204,6 +240,9 @@ impl Worker {
+             trace,
+             failure: None,
+             native: Some(Execution {
++                metadata,
++                limits: self.limits,
++                operations: 0,
+                 session: None,
+                 host: Host::new(scope.clone()),
+                 input: None,
+@@ -243,7 +282,9 @@ impl Worker {
+                 return (None, vec![]);
+             }
+         };
+-        self.begin_fetch(url, method, body, headers, request_id, reply, None, trace)
++        self.begin_fetch(
++            url, method, body, headers, request_id, reply, None, trace, None,
++        )
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+@@ -257,6 +298,7 @@ impl Worker {
+         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
+         scope: Option<String>,
+         trace: Option<crate::telemetry::TraceContext>,
++        native_parent: Option<api::ExecutionMetadata>,
+     ) -> (Option<InFlight>, Vec<Op>) {
+         if Arc::strong_count(&self.live) > 256 {
+             let _ = reply.send(Ok(response(
+@@ -272,7 +314,13 @@ impl Worker {
+             )));
+             return (None, vec![]);
+         }
+-        let mut entry = self.entry(Answer::Fetch(reply), scope, request_id, trace);
++        let mut entry = self.entry(
++            Answer::Fetch(reply),
++            scope,
++            request_id,
++            trace,
++            native_parent,
++        );
+         let _context = CurrentGuard::enter(entry.context.clone());
+         if take_request_cancellation(request_id) {
+             entry.fail_cancelled(anyhow!("The client has disconnected"));
+@@ -290,7 +338,8 @@ impl Worker {
+                 entry.native.as_mut().unwrap().input = Some(input);
+                 match take_body_stream(id) {
+                     Ok(stream) => {
+-                        asyncrt::enqueue(async move { collect(stream).await });
++                        let limit = self.limits.max_payload_bytes;
++                        asyncrt::enqueue(async move { collect(stream, limit).await });
+                         Ok(None)
+                     }
+                     Err(error) => Err(error.into()),
+@@ -308,11 +357,24 @@ impl Worker {
+         input: Incoming,
+         body: &[u8],
+     ) -> Result<Option<Step>, Failure> {
+-        if body.len() > BODY_LIMIT {
++        if body.len() > self.limits.max_payload_bytes {
++            return Err(body_limit());
++        }
++        if body
++            .len()
++            .saturating_add(input.url.len())
++            .saturating_add(input.method.len())
++            .saturating_add(input.headers.iter().fold(0usize, |n, (k, v)| {
++                n.saturating_add(k.len()).saturating_add(v.len())
++            }))
++            > self.limits.max_payload_bytes
++        {
+             return Err(body_limit());
+         }
+         let object = self.object(entry.scope.as_deref())?;
+         let (session, event) = self.program.start(api::Invocation {
++            execution: entry.native.as_ref().unwrap().metadata.clone(),
++            limits: self.limits,
+             request: api::Request {
+                 url: input.url,
+                 method: input.method,
+@@ -354,6 +416,7 @@ impl Worker {
+         }
+         let (scope, answer, alarm) = match job {
+             CellJob::Fetch {
++                native_parent,
+                 scope,
+                 name,
+                 url,
+@@ -379,6 +442,7 @@ impl Worker {
+                     reply,
+                     Some(scope),
+                     trace,
++                    native_parent,
+                 );
+             }
+             CellJob::Alarm {
+@@ -416,11 +480,14 @@ impl Worker {
+             Some(scope.clone()),
+             alarm.as_ref().and_then(|(_, id)| *id),
+             trace,
++            None,
+         );
+         entry.alarm = alarm.map(|(claim, _)| claim);
+         let _context = CurrentGuard::enter(entry.context.clone());
+         let result = (|| {
+             let (session, event) = self.program.start(api::Invocation {
++                execution: entry.native.as_ref().unwrap().metadata.clone(),
++                limits: self.limits,
+                 request: api::Request {
+                     url: "http://native.internal/alarm".into(),
+                     method: "POST".into(),
+@@ -458,13 +525,18 @@ impl Worker {
+         let result = if let Some(input) = execution.input.take() {
+             match result {
+                 Ok(asyncrt::OpOut::Bytes(body)) => self.http(entry, input, &body),
+-                Err(error) if error == "body exceeds 1 MiB" => Err(body_limit()),
++                Err(error) if error == "body exceeds native payload limit" => Err(body_limit()),
+                 Err(error) => Err(error.into()),
+                 _ => Err("invalid native body result".into()),
+             }
+         } else {
+             let session = execution.session.as_mut().expect("suspended session");
+             match result {
++                Ok(asyncrt::OpOut::Native(reply))
++                    if reply.payload_bytes() > self.limits.max_payload_bytes =>
++                {
++                    Err(body_limit())
++                }
+                 Ok(asyncrt::OpOut::Native(reply)) => session.resume(reply),
+                 Err(error) => session.resume(HostReply::Error(error)),
+                 _ => Err("invalid native operation result".into()),
+@@ -489,12 +561,27 @@ impl Worker {
+     fn drive(&self, entry: &mut InFlight, mut event: Step) -> Result<Option<Step>, Failure> {
+         loop {
+             let execution = entry.native.as_mut().expect("live invocation");
++            if entry.started.elapsed() >= Duration::from_millis(self.limits.wall_ms) {
++                return Err("native wall-time limit exceeded".into());
++            }
+             let Step::Call(call) = event else {
+                 if execution.host.in_transaction() {
+                     return Err("unclosed transaction".into());
+                 }
++                if let Step::Return(response) = &event {
++                    if response.payload_bytes() > self.limits.max_payload_bytes {
++                        return Err(body_limit());
++                    }
++                }
+                 return Ok(Some(event));
+             };
++            execution.operations += 1;
++            if execution.operations > self.limits.max_operations {
++                return Err("native operation limit exceeded".into());
++            }
++            if call.payload_bytes() > self.limits.max_payload_bytes {
++                return Err(body_limit());
++            }
+             let reply = if Host::handles(&call) {
+                 match execution.host.call(call) {
+                     Ok((reply, alarm)) => {
+@@ -515,6 +602,9 @@ impl Worker {
+                     Err(error) => HostReply::Error(error),
+                 }
+             };
++            if reply.payload_bytes() > self.limits.max_payload_bytes {
++                return Err(body_limit());
++            }
+             event = entry
+                 .native
+                 .as_mut()
+@@ -575,9 +665,10 @@ impl Worker {
+                     headers,
+                     body,
+                 } = request;
+-                if body.len() > BODY_LIMIT {
+-                    return Err("fetch body exceeds 1 MiB".into());
++                if body.len() > self.limits.max_payload_bytes {
++                    return Err("fetch body exceeds native payload limit".into());
+                 }
++                let limit = self.limits.max_payload_bytes;
+                 let future = native_fetch(
+                     api::Request {
+                         url,
+@@ -596,11 +687,15 @@ impl Worker {
+                         .iter()
+                         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
+                         .collect();
+-                    let body =
+-                        collect(Box::pin(response.bytes_stream().map(|chunk| {
+-                            chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())
+-                        })))
+-                        .await?;
++                    let body = collect(
++                        Box::pin(
++                            response
++                                .bytes_stream()
++                                .map(|chunk| chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())),
++                        ),
++                        limit,
++                    )
++                    .await?;
+                     Ok(asyncrt::OpOut::Native(HostReply::Fetch(api::Response {
+                         status,
+                         headers,
+@@ -617,7 +712,7 @@ impl Worker {
+                 if !self.program.classes().contains(class) {
+                     return Err("unknown durable class".into());
+                 }
+-                if body.len() > BODY_LIMIT {
++                if body.len() > self.limits.max_payload_bytes {
+                     return Err("object arguments exceed 1 MiB".into());
+                 }
+                 let name = object.id;
+@@ -642,6 +737,7 @@ impl Worker {
+                 let (reply, receive) = tokio::sync::oneshot::channel();
+                 let body = RequestBody::Bytes(body.into());
+                 let request = DoCallReq {
++                    native_parent: Some(entry.native.as_ref().unwrap().metadata.clone()),
+                     request_id: Some(request_id),
+                     cancel: Some(cancel),
+                     deliver_abort_to_handler: false,
+@@ -656,6 +752,7 @@ impl Worker {
+                     order,
+                     parent: entry.trace,
+                 };
++                let limit = self.limits.max_payload_bytes;
+                 asyncrt::enqueue(async move {
+                     gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
+                     let response = receive
+@@ -663,7 +760,7 @@ impl Worker {
+                         .map_err(|_| "durable call dropped".to_string())?
+                         .map_err(|e| e.to_string())?;
+                     cancel_guard.disarm();
+-                    if response.body.len() > BODY_LIMIT {
++                    if response.body.len() > limit {
+                         return Err("object result exceeds 1 MiB".into());
+                     }
+                     Ok(asyncrt::OpOut::Native(HostReply::Object(api::Response {
+@@ -749,7 +846,7 @@ fn body_limit() -> Failure {
+     Failure {
+         status: 413,
+         code: "body_too_large".into(),
+-        message: "body exceeds 1 MiB".into(),
++        message: "body exceeds native payload limit".into(),
+     }
+ }
+ fn response(
+@@ -838,12 +935,12 @@ fn native_fetch(
+         result
+     }
+ }
+-async fn collect(mut stream: HttpChunkStream) -> Result<Vec<u8>, String> {
++async fn collect(mut stream: HttpChunkStream, limit: usize) -> Result<Vec<u8>, String> {
+     let mut body = Vec::new();
+     while let Some(chunk) = stream.next().await {
+         let chunk = chunk?;
+-        if chunk.len() > BODY_LIMIT - body.len() {
+-            return Err("body exceeds 1 MiB".into());
++        if chunk.len() > limit - body.len() {
++            return Err("body exceeds native payload limit".into());
+         }
+         body.extend_from_slice(&chunk);
+     }
+diff --git a/crates/celld/runtime.rs b/crates/celld/runtime.rs
+index 847df59..c74f7fc 100644
+--- a/crates/celld/runtime.rs
++++ b/crates/celld/runtime.rs
+@@ -892,6 +892,7 @@ pub struct ServiceFetch {
+ 
+ /// Owned HTTP request crossing from the async shell into a V8 executor.
+ pub struct RuntimeFetch {
++    pub native_parent: Option<celld_runtime::ExecutionMetadata>,
+     pub url: String,
+     pub method: String,
+     pub body: js::RequestBody,
+@@ -1140,6 +1141,7 @@ impl Generation {
+                 .with_loader(loader_binding)
+                 .with_queue_consumers(queue_catalog.clone())
+                 .with_crons(crons.clone())
++                .with_deployment_id(version.clone())
+                 .with_generation(id),
+         );
+         let stateless = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
+@@ -1176,6 +1178,7 @@ impl Generation {
+         }
+         for target in cohosted {
+             let crate::fleet::LoadedDeployment {
++                version: target_version,
+                 options,
+                 script_name: script,
+                 asset_binding,
+@@ -1192,6 +1195,7 @@ impl Generation {
+                     .with_services(services)
+                     .with_asset_binding(asset_binding)
+                     .with_queue_consumers(queue_catalog.clone())
++                    .with_deployment_id(target_version)
+                     .with_generation(id),
+             );
+             let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
+@@ -1646,6 +1650,7 @@ impl RuntimeManager {
+         inline_activity: crate::CellActivityGuard,
+     ) -> anyhow::Result<HttpResponse> {
+         let RuntimeFetch {
++        native_parent: _,
+             url,
+             method,
+             body,
+@@ -2188,6 +2193,7 @@ impl RuntimeManager {
+         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+     ) -> anyhow::Result<HttpResponse> {
+         let RuntimeFetch {
++        native_parent,
+             url,
+             method,
+             body,
+@@ -2219,6 +2225,7 @@ impl RuntimeManager {
+         } = admitted;
+         let (reply, receive) = tokio::sync::oneshot::channel();
+         let job = CellJob::Fetch {
++            native_parent,
+             request_id,
+             scope: cell,
+             name,

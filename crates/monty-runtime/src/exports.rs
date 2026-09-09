@@ -89,11 +89,13 @@ pub struct Function {
     pub(crate) extensions: Arc<crate::extensions::Extensions>,
 }
 impl Function {
-    pub(crate) fn start(
+    pub(crate) fn start_with_limits(
         &self,
         args: &Value,
         context: &Value,
+        limits: celld_runtime::ExecutionLimits,
     ) -> Result<RunProgress, crate::Failure> {
+        limits.validate()?;
         let args = args
             .as_object()
             .ok_or_else(|| crate::Failure::arguments("arguments must be an object"))?;
@@ -120,8 +122,9 @@ impl Function {
             }
         }
         let limits = ResourceLimits {
-            max_duration: Some(Duration::from_millis(100)),
+            max_duration: Some(Duration::from_millis(limits.cpu_ms)),
             max_recursion_depth: 100,
+            max_suspensions: limits.max_operations,
             ..Default::default()
         };
         let mut inputs = vec![

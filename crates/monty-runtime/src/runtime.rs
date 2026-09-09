@@ -24,14 +24,20 @@ const DESCRIPTOR: api::Descriptor = api::Descriptor {
     extension: "py",
     main_module: "index.py",
     artifact_prefix: "# celld:monty-native-v1\n",
-    required_feature: "monty-filesystem-v1",
+    required_feature: "monty-execution-v1",
 };
 impl api::Runtime for Monty {
     fn descriptor(&self) -> &api::Descriptor {
         &DESCRIPTOR
     }
     fn supported_features(&self) -> Vec<&'static str> {
-        vec!["monty-native-v1", "monty-modules-v1", "monty-network-policy-v1", "monty-filesystem-v1"]
+        vec![
+            "monty-native-v1",
+            "monty-modules-v1",
+            "monty-network-policy-v1",
+            "monty-filesystem-v1",
+            "monty-execution-v1",
+        ]
     }
     fn types(&self) -> &str {
         &self.extensions.modules["celld"].types
@@ -132,10 +138,19 @@ impl Program {
         &self,
         call: api::Invocation,
     ) -> Result<(Box<dyn api::Execution>, Step), Failure> {
+        call.limits.validate()?;
+        if call.request.payload_bytes() > call.limits.max_payload_bytes {
+            return Err("request exceeds payload limit".into());
+        }
         let fetch_context = crate::FetchContext {
+            execution: call.execution.clone(),
+            limits: call.limits,
             request_url: call.request.url.clone(),
             env: call.env.clone(),
-            object: call.object.as_ref().map(|o| (o.class.clone(), o.id.clone())),
+            object: call
+                .object
+                .as_ref()
+                .map(|o| (o.class.clone(), o.id.clone())),
             alarm: call.alarm,
         };
         let input = call.request;
@@ -166,7 +181,7 @@ impl Program {
             serde_json::from_slice(&input.body)
                 .map_err(|_| Failure::arguments("request body must be a UTF-8 JSON object"))?
         };
-        let (function, args, metadata) = if let Some(object) = call.object {
+        let (function, args, mut metadata) = if let Some(object) = call.object {
             if !call.alarm && name == "alarm" {
                 return Err("alarm is dispatched by the host".into());
             }
@@ -203,7 +218,9 @@ impl Program {
                 json!({"id":null,"env":call.env,"request":{"url":input.url,"method":input.method,"headers":headers_object(input.headers)}}),
             )
         };
-        let (session, event) = Session::start(function, &args, &metadata)?;
+        metadata["execution"] = serde_json::to_value(&call.execution).map_err(|e| e.to_string())?;
+        metadata["limits"] = serde_json::to_value(call.limits).map_err(|e| e.to_string())?;
+        let (session, event) = Session::start_with_limits(function, &args, &metadata, call.limits)?;
         let mut execution = Execution {
             session: Some(session),
             network: self.network.clone(),
@@ -233,6 +250,9 @@ impl api::Execution for Execution {
 }
 impl Execution {
     fn resume_inner(&mut self, reply: HostReply) -> Result<Step, Failure> {
+        if reply.payload_bytes() > self.fetch_context.limits.max_payload_bytes {
+            return Err("host reply exceeds payload limit".into());
+        }
         let session = self.session.as_mut().ok_or("execution already completed")?;
         let event = match reply {
             HostReply::Filesystem(reply) => session.resume_filesystem(reply)?,
@@ -266,8 +286,15 @@ impl Execution {
                 Ok(Event::Resume(response)) => {
                     // Interpreter failures after a synthetic reply are final,
                     // not argument errors on the already-consumed host call.
-                    event = self.session.as_mut().ok_or("execution already completed")?
-                        .resume_fetch(response.status, headers_object(response.headers), response.body)?;
+                    event = self
+                        .session
+                        .as_mut()
+                        .ok_or("execution already completed")?
+                        .resume_fetch(
+                            response.status,
+                            headers_object(response.headers),
+                            response.body,
+                        )?;
                 }
                 Ok(Event::Step(step)) => return Ok(step),
                 Err(error) => return Err(error),
@@ -285,6 +312,9 @@ impl Execution {
                 },
                 None => json_response(200, json!({"wire":event["wire"]})),
             };
+            if response.payload_bytes() > self.fetch_context.limits.max_payload_bytes {
+                return Err("response exceeds payload limit".into());
+            }
             self.session.take();
             return Ok(Event::Step(Step::Return(response)));
         }
@@ -381,6 +411,9 @@ impl Execution {
             "log" => HostCall::Log(text(0)?),
             _ => return Err("unknown capability".into()),
         };
+        if call.payload_bytes() > self.fetch_context.limits.max_payload_bytes {
+            return Err("host call exceeds payload limit".into());
+        }
         if let HostCall::Fetch(request) = call {
             return match self.network.intercept(&self.fetch_context, request) {
                 crate::FetchDecision::Forward(request) => {
@@ -392,7 +425,7 @@ impl Execution {
                     }))))
                 }
                 crate::FetchDecision::Respond(response) => {
-                    if response.body.len() > 1024 * 1024 {
+                    if response.payload_bytes() > self.fetch_context.limits.max_payload_bytes {
                         return Err("fetch response exceeds 1 MiB".into());
                     }
                     // The outer event loop resumes locally, avoiding recursive
@@ -421,7 +454,12 @@ fn complete(response: Response) -> Result<(Box<dyn api::Execution>, Step), Failu
             session: None,
             network: crate::network::Network::default(),
             fetch_context: crate::FetchContext {
-                request_url: String::new(), env: Value::Null, object: None, alarm: false,
+                execution: Default::default(),
+                limits: Default::default(),
+                request_url: String::new(),
+                env: Value::Null,
+                object: None,
+                alarm: false,
             },
             request: Value::Null,
         }),

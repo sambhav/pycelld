@@ -76,8 +76,29 @@ class Request:
         self.headers = metadata.get("headers", {})
 
 
+class ExecutionMetadata:
+    def __init__(self, metadata):
+        self.worker_id = metadata.get("worker_id", "")
+        self.deployment_id = metadata.get("deployment_id", "")
+        self.invocation_id = metadata.get("invocation_id", "")
+        self.runtime_instance_id = metadata.get("runtime_instance_id", "")
+        self.root_invocation_id = metadata.get("root_invocation_id", "")
+        self.parent_invocation_id = metadata.get("parent_invocation_id")
+        self.principal = metadata.get("principal")
+
+
+class ExecutionLimits:
+    def __init__(self, metadata):
+        self.cpu_ms = metadata.get("cpu_ms", 100)
+        self.wall_ms = metadata.get("wall_ms", 30000)
+        self.max_operations = metadata.get("max_operations", 10000)
+        self.max_payload_bytes = metadata.get("max_payload_bytes", 1048576)
+
+
 class Context:
     def __init__(self, metadata):
+        self.execution = ExecutionMetadata(metadata.get("execution", {}))
+        self.limits = ExecutionLimits(metadata.get("limits", {}))
         self.id = metadata.get("id")
         self.env = metadata.get("env", {})
         self.request = Request(metadata.get("request", {}))
