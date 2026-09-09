@@ -1,0 +1,7 @@
+{
+  "name": "python-api",
+  "main": "worker.py",
+  "vars": {
+    "CATALOG_URL": "https://api.example.com/catalog"
+  }
+}

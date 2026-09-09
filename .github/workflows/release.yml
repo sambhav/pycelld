@@ -107,6 +107,10 @@ jobs:
           python3 tools/monty-checks/e2e.py "target/$TARGET/release/celld"
           "target/$TARGET/release/celld" types > generated.pyi
           cmp generated.pyi crates/monty-runtime/src/celld.pyi
+      - name: Exercise Python install, init, check and pytest on this platform
+        run: |
+          python3 -m pip install '.[test]'
+          python3 -m pytest python/tests examples/python-api/tests --celld-binary "target/$TARGET/release/celld" -q
       - name: Package and verify binary
         run: |
           set -euo pipefail
