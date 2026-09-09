@@ -754,7 +754,7 @@ fn span_records_caught_errors_and_public_error_messages_are_opt_in() {
 
 #[test]
 fn package_can_reexport_one_http_handler() {
-    assert_eq!(Monty::new().descriptor().required_feature, "monty-http-v1");
+    assert_eq!(Monty::new().descriptor().required_feature, "monty-application-policy-v1");
     assert!(Monty::new().supported_features().contains(&"monty-http-v1"));
     let source = package("app", &[
         ("app", true, "from .handlers import handle as endpoint\n__all__ = ['endpoint']"),

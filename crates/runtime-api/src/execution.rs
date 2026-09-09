@@ -6,6 +6,10 @@ use serde_json::Value;
 /// Empty metadata is useful to embedders/tests but is never issued by celld.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionMetadata {
+    #[serde(default)]
+    pub application: ApplicationIdentity,
+    #[serde(default)]
+    pub policy_revision: String,
     pub worker_id: String,
     pub deployment_id: String,
     pub invocation_id: String,
@@ -13,6 +17,18 @@ pub struct ExecutionMetadata {
     pub root_invocation_id: String,
     pub parent_invocation_id: Option<String>,
     pub principal: Option<VerifiedPrincipal>,
+}
+
+/// Operator-owned placement, independent of the authenticated caller and storage keys.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationIdentity {
+    pub project_id: String,
+    pub application_id: String,
+    pub stage: Option<String>,
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// An embedding host may attach a principal after authentication. Neither the
@@ -33,6 +49,10 @@ pub struct ExecutionLimits {
     pub wall_ms: u64,
     pub max_operations: usize,
     pub max_payload_bytes: usize,
+    pub max_recursion_depth: usize,
+    /// Reserved for an invocation-safe allocator/isolation backend. A configured
+    /// value is rejected, never silently ignored by the shared-process runtime.
+    pub max_memory_bytes: Option<usize>,
 }
 impl Default for ExecutionLimits {
     fn default() -> Self {
@@ -41,11 +61,19 @@ impl Default for ExecutionLimits {
             wall_ms: 30_000,
             max_operations: 10_000,
             max_payload_bytes: 1024 * 1024,
+            max_recursion_depth: 100,
+            max_memory_bytes: None,
         }
     }
 }
 impl ExecutionLimits {
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_memory_bytes.is_some() {
+            return Err("max_memory_bytes is unavailable: Monty's process-wide allocator cannot isolate concurrent invocations".into());
+        }
+        if !(1..=100).contains(&self.max_recursion_depth) {
+            return Err("max_recursion_depth must be 1-100".into());
+        }
         if !(1..=60_000).contains(&self.cpu_ms) {
             return Err("cpu_ms must be 1-60000".into());
         }

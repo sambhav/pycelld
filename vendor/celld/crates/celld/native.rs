@@ -33,3 +33,8 @@ pub(crate) fn bundle(root: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
     )
     .into_bytes())
 }
+
+#[path = "native_policy.rs"]
+mod execution_policy;
+pub use execution_policy::{execution_policy, replace_execution_policy};
+pub(crate) use execution_policy::resolve_execution_policy;

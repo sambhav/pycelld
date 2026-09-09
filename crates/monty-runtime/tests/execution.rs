@@ -8,6 +8,12 @@ fn invocation(limits: ExecutionLimits) -> Invocation {
     Invocation {
         observer: None,
         execution: ExecutionMetadata {
+            application: celld_runtime::ApplicationIdentity {
+                project_id: "project-1".into(),
+                application_id: "app-1".into(),
+                stage: Some("production".into()),
+                ..Default::default()
+            },
             worker_id: "trusted-worker".into(),
             deployment_id: "version-1".into(),
             runtime_instance_id: "slot-1".into(),
@@ -32,10 +38,11 @@ fn python_mutations_cannot_change_policy_identity_or_limits() {
     let runtime = Monty::new().with_fetch_middleware(|context, _| {
         assert_eq!(context.execution.worker_id, "trusted-worker");
         assert_eq!(context.execution.invocation_id, "call-1");
+        assert_eq!(context.execution.application.project_id, "project-1");
         assert_eq!(context.limits.max_operations, 2);
         FetchDecision::Deny("checked authoritative metadata".into())
     });
-    let program = runtime.compile("async def run(ctx):\n    ctx.execution.worker_id = 'spoofed'\n    ctx.execution.invocation_id = 'spoofed'\n    ctx.limits.max_operations = 999999\n    try:\n        await ctx.fetch('https://example.test')\n    except RuntimeError:\n        ctx.now()\n        ctx.now()\n").unwrap();
+    let program = runtime.compile("async def run(ctx):\n    ctx.execution.application.project_id = 'spoofed'\n    ctx.execution.worker_id = 'spoofed'\n    ctx.execution.invocation_id = 'spoofed'\n    ctx.limits.max_operations = 999999\n    try:\n        await ctx.fetch('https://example.test')\n    except RuntimeError:\n        ctx.now()\n        ctx.now()\n").unwrap();
     let (mut execution, step) = program
         .start(invocation(ExecutionLimits {
             max_operations: 2,
@@ -127,4 +134,53 @@ fn cpu_budget_survives_host_suspensions() {
             }
         }
     }
+}
+
+#[test]
+fn suspension_wait_does_not_consume_cpu_and_each_invocation_gets_a_new_budget() {
+    let program = Monty::new()
+        .compile("def run(ctx):\n    ctx.now()\n    return 'done'\n")
+        .unwrap();
+    let limits = ExecutionLimits {
+        cpu_ms: 100,
+        max_operations: 1,
+        ..Default::default()
+    };
+    let (mut one, _) = program.start(invocation(limits)).unwrap();
+    let (mut two, _) = program.start(invocation(limits)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(matches!(
+        one.resume(HostReply::Timestamp(Some(0))).unwrap(),
+        Step::Return(_)
+    ));
+    assert!(matches!(
+        two.resume(HostReply::Timestamp(Some(0))).unwrap(),
+        Step::Return(_)
+    ));
+}
+
+#[test]
+fn recursion_is_configurable_and_unsupported_memory_limits_fail_before_entry() {
+    let program = Monty::new().compile("def recurse(n):\n    if n == 0: return 1\n    return recurse(n - 1)\ndef run(): return recurse(25)\n").unwrap();
+    assert!(
+        program
+            .start(invocation(ExecutionLimits::default()))
+            .is_ok()
+    );
+    let error = program
+        .start(invocation(ExecutionLimits {
+            max_recursion_depth: 15,
+            ..Default::default()
+        }))
+        .err()
+        .unwrap();
+    assert!(error.message.contains("recursion"), "{error}");
+    let error = program
+        .start(invocation(ExecutionLimits {
+            max_memory_bytes: Some(1024 * 1024),
+            ..Default::default()
+        }))
+        .err()
+        .unwrap();
+    assert!(error.message.contains("allocator"), "{error}");
 }

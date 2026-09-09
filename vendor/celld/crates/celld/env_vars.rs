@@ -38,7 +38,7 @@ pub struct ShutdownTiming {
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
-    native_limits()?;
+    crate::native::execution_policy()?;
     cell_isolate_limit()?;
     crate::s3_etag::S3EtagMode::from_env()?;
     for name in [

@@ -1,0 +1,30 @@
+{
+  "revision": "2026-09-09.1",
+  "defaults": {
+    "cpu_ms": 100,
+    "wall_ms": 30000,
+    "max_operations": 10000,
+    "max_payload_bytes": 1048576,
+    "max_recursion_depth": 100
+  },
+  "workers": {
+    "orders-api-prod": {
+      "project_id": "acme",
+      "application_id": "orders",
+      "stage": "production",
+      "tier": "pro",
+      "labels": { "region": "eu", "cost_center": "commerce" }
+    },
+    "orders-api-preview": {
+      "project_id": "acme",
+      "application_id": "orders",
+      "stage": "preview",
+      "tier": "free"
+    }
+  },
+  "rules": [
+    { "matches": { "tier": "pro" }, "limits": { "cpu_ms": 500, "max_operations": 50000 } },
+    { "matches": { "stage": "preview" }, "limits": { "wall_ms": 5000, "max_operations": 1000 } },
+    { "matches": { "project_id": "acme", "labels.region": "eu" }, "limits": { "max_payload_bytes": 524288 } }
+  ]
+}

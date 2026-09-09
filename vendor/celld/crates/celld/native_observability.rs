@@ -14,6 +14,11 @@ pub(crate) fn observer(
 ) -> Arc<dyn Observer> {
     // Do not copy principal claims, request headers, variables, or secrets to logs.
     let identity = json!({
+        "project_id":metadata.application.project_id,
+        "application_id":metadata.application.application_id,
+        "stage":metadata.application.stage,
+        "tier":metadata.application.tier,
+        "policy_revision":metadata.policy_revision,
         "worker_id":metadata.worker_id,
         "deployment_id":metadata.deployment_id,
         "invocation_id":metadata.invocation_id,

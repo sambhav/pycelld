@@ -52,4 +52,5 @@ jobs:
       - run: python tools/monty-checks/http_handlers.py target/lab/celld
       - run: python -m pytest python/tests examples/python-api/tests --celld-binary target/lab/celld -q
       - run: python tools/monty-checks/network_policy.py target/lab/celld
+      - run: python tools/monty-checks/execution_policy.py target/lab/celld
       - run: python tools/monty-checks/consumer.py

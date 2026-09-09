@@ -13,7 +13,6 @@ mod tests;
 pub struct Worker {
     runtime_instance_id: String,
     deployment_id: String,
-    limits: api::ExecutionLimits,
     config: Arc<WorkerConfig>,
     program: Box<dyn api::Program>,
     env: Value,
@@ -58,6 +57,7 @@ struct Incoming {
 pub(super) struct Execution {
     pub(super) metadata: api::ExecutionMetadata,
     limits: api::ExecutionLimits,
+    admission_error: Option<String>,
     operations: usize,
     session: Option<Box<dyn api::Execution>>,
     host: Host,
@@ -74,7 +74,7 @@ impl Execution {
 
 impl Worker {
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Self> {
-        let limits = crate::env_vars::native_limits()?;
+        crate::native::execution_policy()?;
         let runtime_instance_id = crate::native_host::new_uuid().map_err(|e| anyhow!(e))?;
         let deployment_id = config.deployment_id.clone().unwrap_or_else(|| {
             use sha2::Digest;
@@ -122,7 +122,6 @@ impl Worker {
         Ok(Self {
             runtime_instance_id,
             deployment_id,
-            limits,
             program,
             config,
             env: Value::Object(env),
@@ -197,7 +196,18 @@ impl Worker {
         parent: Option<api::ExecutionMetadata>,
     ) -> InFlight {
         let invocation_id = crate::native_host::new_uuid().expect("OS random source unavailable");
+        let resolved = crate::native::resolve_execution_policy(&self.config.script_name);
+        let (policy, admission_error) = match resolved {
+            Ok(policy) => (policy, None),
+            Err(error) => (api::policy::ResolvedExecutionPolicy {
+                revision: String::new(),
+                application: Default::default(),
+                limits: Default::default(),
+            }, Some(error.to_string())),
+        };
         let metadata = api::ExecutionMetadata {
+            application: policy.application,
+            policy_revision: policy.revision,
             worker_id: self.config.script_name.clone(),
             deployment_id: self.deployment_id.clone(),
             runtime_instance_id: self.runtime_instance_id.clone(),
@@ -241,7 +251,8 @@ impl Worker {
             failure: None,
             native: Some(Execution {
                 metadata,
-                limits: self.limits,
+                limits: policy.limits,
+                admission_error,
                 operations: 0,
                 session: None,
                 host: Host::new(scope.clone()),
@@ -321,6 +332,11 @@ impl Worker {
             trace,
             native_parent,
         );
+        let limits = entry.native.as_ref().unwrap().limits;
+        if entry.native.as_ref().unwrap().admission_error.is_some() {
+            self.finish(&mut entry, Err(policy_unavailable()));
+            return (Some(entry), vec![]);
+        }
         let _context = CurrentGuard::enter(entry.context.clone());
         if take_request_cancellation(request_id) {
             entry.fail_cancelled(anyhow!("The client has disconnected"));
@@ -338,7 +354,7 @@ impl Worker {
                 entry.native.as_mut().unwrap().input = Some(input);
                 match take_body_stream(id) {
                     Ok(stream) => {
-                        let limit = self.limits.max_payload_bytes;
+                        let limit = limits.max_payload_bytes;
                         asyncrt::enqueue(async move { collect(stream, limit).await });
                         Ok(None)
                     }
@@ -357,7 +373,8 @@ impl Worker {
         input: Incoming,
         body: &[u8],
     ) -> Result<Option<Step>, Failure> {
-        if body.len() > self.limits.max_payload_bytes {
+        let limits = entry.native.as_ref().unwrap().limits;
+        if body.len() > limits.max_payload_bytes {
             return Err(body_limit());
         }
         if body
@@ -367,7 +384,7 @@ impl Worker {
             .saturating_add(input.headers.iter().fold(0usize, |n, (k, v)| {
                 n.saturating_add(k.len()).saturating_add(v.len())
             }))
-            > self.limits.max_payload_bytes
+            > limits.max_payload_bytes
         {
             return Err(body_limit());
         }
@@ -375,7 +392,7 @@ impl Worker {
         let (session, event) = self.program.start(api::Invocation {
             observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, object.as_ref(), entry.trace)),
             execution: entry.native.as_ref().unwrap().metadata.clone(),
-            limits: self.limits,
+            limits: limits,
             request: api::Request {
                 url: input.url,
                 method: input.method,
@@ -486,10 +503,14 @@ impl Worker {
         entry.alarm = alarm.map(|(claim, _)| claim);
         let _context = CurrentGuard::enter(entry.context.clone());
         let result = (|| {
+            if entry.native.as_ref().unwrap().admission_error.is_some() {
+                return Err(policy_unavailable());
+            }
+            let limits = entry.native.as_ref().unwrap().limits;
             let (session, event) = self.program.start(api::Invocation {
                 observer: Some(crate::native_observability::observer(&entry.native.as_ref().unwrap().metadata, self.object(Some(&scope))?.as_ref(), entry.trace)),
                 execution: entry.native.as_ref().unwrap().metadata.clone(),
-                limits: self.limits,
+                limits: limits,
                 request: api::Request {
                     url: "http://native.internal/alarm".into(),
                     method: "POST".into(),
@@ -524,6 +545,7 @@ impl Worker {
         let Some(execution) = entry.native.as_mut() else {
             return vec![];
         };
+        let limits = execution.limits;
         let result = if let Some(input) = execution.input.take() {
             match result {
                 Ok(asyncrt::OpOut::Bytes(body)) => self.http(entry, input, &body),
@@ -535,7 +557,7 @@ impl Worker {
             let session = execution.session.as_mut().expect("suspended session");
             match result {
                 Ok(asyncrt::OpOut::Native(reply))
-                    if reply.payload_bytes() > self.limits.max_payload_bytes =>
+                    if reply.payload_bytes() > limits.max_payload_bytes =>
                 {
                     Err(body_limit())
                 }
@@ -561,9 +583,10 @@ impl Worker {
         }
     }
     fn drive(&self, entry: &mut InFlight, mut event: Step) -> Result<Option<Step>, Failure> {
+        let limits = entry.native.as_ref().unwrap().limits;
         loop {
             let execution = entry.native.as_mut().expect("live invocation");
-            if entry.started.elapsed() >= Duration::from_millis(self.limits.wall_ms) {
+            if entry.started.elapsed() >= Duration::from_millis(limits.wall_ms) {
                 return Err("native wall-time limit exceeded".into());
             }
             let Step::Call(call) = event else {
@@ -571,17 +594,17 @@ impl Worker {
                     return Err("unclosed transaction".into());
                 }
                 if let Step::Return(response) = &event {
-                    if response.payload_bytes() > self.limits.max_payload_bytes {
+                    if response.payload_bytes() > limits.max_payload_bytes {
                         return Err(body_limit());
                     }
                 }
                 return Ok(Some(event));
             };
             execution.operations += 1;
-            if execution.operations > self.limits.max_operations {
+            if execution.operations > limits.max_operations {
                 return Err("native operation limit exceeded".into());
             }
-            if call.payload_bytes() > self.limits.max_payload_bytes {
+            if call.payload_bytes() > limits.max_payload_bytes {
                 return Err(body_limit());
             }
             let reply = if Host::handles(&call) {
@@ -604,7 +627,7 @@ impl Worker {
                     Err(error) => HostReply::Error(error),
                 }
             };
-            if reply.payload_bytes() > self.limits.max_payload_bytes {
+            if reply.payload_bytes() > limits.max_payload_bytes {
                 return Err(body_limit());
             }
             event = entry
@@ -619,6 +642,7 @@ impl Worker {
     }
 
     fn suspend(&self, entry: &mut InFlight, call: HostCall) -> Result<(), String> {
+        let limits = entry.native.as_ref().unwrap().limits;
         match call {
             HostCall::Sync => {
                 let scope = entry
@@ -667,10 +691,10 @@ impl Worker {
                     headers,
                     body,
                 } = request;
-                if body.len() > self.limits.max_payload_bytes {
+                if body.len() > limits.max_payload_bytes {
                     return Err("fetch body exceeds native payload limit".into());
                 }
-                let limit = self.limits.max_payload_bytes;
+                let limit = limits.max_payload_bytes;
                 let future = native_fetch(
                     api::Request {
                         url,
@@ -714,7 +738,7 @@ impl Worker {
                 if !self.program.classes().contains(class) {
                     return Err("unknown durable class".into());
                 }
-                if body.len() > self.limits.max_payload_bytes {
+                if body.len() > limits.max_payload_bytes {
                     return Err("object arguments exceed 1 MiB".into());
                 }
                 let name = object.id;
@@ -754,7 +778,7 @@ impl Worker {
                     order,
                     parent: entry.trace,
                 };
-                let limit = self.limits.max_payload_bytes;
+                let limit = limits.max_payload_bytes;
                 asyncrt::enqueue(async move {
                     gated_channel_send(gate, &DO_CALL_TX, request, "no proxy channel").await?;
                     let response = receive
@@ -947,4 +971,12 @@ async fn collect(mut stream: HttpChunkStream, limit: usize) -> Result<Vec<u8>, S
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn policy_unavailable() -> Failure {
+    Failure {
+        status: 503,
+        code: "execution_policy_unavailable".into(),
+        message: "execution policy is unavailable for this application".into(),
+    }
 }

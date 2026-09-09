@@ -15,7 +15,8 @@ def handle(request: Request) -> Response:
 The handler takes `request` and optionally `ctx: Context`, and can be synchronous
 or asynchronous. `ctx.request` is the same request. No framework is needed.
 Run the [example](../examples/http/worker.py) with `celld dev examples/http`.
-New Python deployments require the `monty-http-v1` host feature, so older nodes
+HTTP handlers use the `monty-http-v1` host capability; see [builds](build.md)
+for the current deployment feature requirement. Older nodes
 reject them before worker activation.
 
 ## Routing and exports

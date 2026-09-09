@@ -98,6 +98,12 @@ Embedding hosts can install
 [fetch middleware](docs/extensions.md#outbound-http-middleware) to approve,
 rewrite, answer or deny calls without a JavaScript bridge.
 
+[Live execution policies](docs/execution.md) map workers to projects,
+applications, stages, tiers, and custom labels. Change CPU, wall-time, operation,
+payload, and recursion limits for new invocations without restarting workers.
+Per-invocation memory quotas remain unsupported; configured memory limits are
+rejected explicitly.
+
 Workers can also export a package through its `__init__.py`; set `main` to the
 package directory.
 

@@ -110,7 +110,6 @@ async fn errors_cancellation_sync_and_paged_storage_preserve_durability() {
     let mut worker = Worker {
         runtime_instance_id: "test-slot".into(),
         deployment_id: "test-deployment".into(),
-        limits: Default::default(),
         config,
         program: Box::new(TestProgram),
         env: json!({}),
@@ -356,11 +355,6 @@ fn identity_worker() -> Worker {
     Worker {
         runtime_instance_id: crate::native_host::new_uuid().unwrap(),
         deployment_id: "deployment-1".into(),
-        limits: api::ExecutionLimits {
-            cpu_ms: 1,
-            wall_ms: 5,
-            ..Default::default()
-        },
         config: Arc::new(WorkerConfig::new(WorkerConfigOptions {
             src: String::new(),
             script_name: "identity-worker".into(),
@@ -408,6 +402,7 @@ async fn native_identity_scopes_parentage_slot_reuse_and_cancellation() {
         third.native.as_ref().unwrap().metadata.runtime_instance_id,
         parent.runtime_instance_id
     );
+    first.native.as_mut().unwrap().limits.wall_ms = 5;
     assert!(first.remaining(Duration::from_secs(300)).unwrap() <= Duration::from_millis(5));
     tokio::time::sleep(Duration::from_millis(6)).await;
     assert_eq!(

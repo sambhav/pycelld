@@ -126,7 +126,7 @@ impl Function {
         }
         let limits = ResourceLimits {
             max_duration: Some(Duration::from_millis(limits.cpu_ms)),
-            max_recursion_depth: 100,
+            max_recursion_depth: limits.max_recursion_depth,
             max_suspensions: limits.max_operations,
             ..Default::default()
         };
