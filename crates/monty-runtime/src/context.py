@@ -122,12 +122,12 @@ class Context:
         _celld_host("log", message, level, fields or {})
 
     def span(self, name: str, *, fields: dict | None = None):
-        return _Span(name, fields or {})
+        return Span(name, fields or {})
 
-class _Span:
-    def __init__(self, name, fields):
+class Span:
+    def __init__(self, name: str, fields: dict | None = None):
         self._name = name
-        self._fields = fields
+        self._fields = fields or {}
         self._token = None
 
     def __enter__(self):
